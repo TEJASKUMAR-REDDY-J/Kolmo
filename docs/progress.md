@@ -1,0 +1,11 @@
+# Progress checkpoint (paused 2026-10-27)
+
+Work paused on request. This commit is a work-in-progress snapshot; nothing has been pushed.
+
+| Area | State at pause | Resume with |
+|---|---|---|
+| Reference solver (`kolmo/systems/fluid2d.py`) | **Done.** `python -m pytest tests/test_fluid2d.py -q` gave 8 passed: Taylor-Green 9.7e-6, Kolmogorov steady state 7.4e-6, energy budget 1.6e-4, temporal order 3.06, determinism, CFL refusal, batching, penalised cylinder. Details in `progress-solver.md` and `physics.md` | the two wording fixes listed in `progress-solver.md` (cylinder Cd claim) |
+| Surrogates, rollout, hybrid, evaluation, diagnosis, experiments | All modules written and developed against the diffusion system (`tests/test_surrogates.py`, `benchmarks/diffusion_smoke.json`). The agent was stopped in the middle of an edit, making the report robust when hybrid policies are missing. **The Kolmogorov-flow experiments have not run.** | re-run `tests/test_surrogates.py` first, finish that edit, then run the baseline vs rollout-aware experiment at 64² |
+| UI (`kolmo/app/`) | First version written: window, widgets, backend, `tests/gui_smoke.py`, `docs/ui.md`. The glass/fabric redesign brief was delivered (`docs/design/reference.webp`), but how much of it is implemented is unknown. The agent was stopped while preparing a tiny diffusion surrogate to exercise surrogate/hybrid modes | run `tests/gui_smoke.py`, check the screenshots, continue the redesign |
+| Photo geometry (`kolmo/geometry/`) | Part A written: GrabCut fallback segmenter, mask → grid, CLI, `tests/test_geometry.py`, `docs/geometry.md`. SAM 3 code cloned to `third_party/` (gitignored); `sam3_bridge.py` and `sam3_bench.py` written. SAM 3.1 access is granted and HF login is active. The agent was stopped while writing the SAM 3 benchmark script; whether the SAM 3.1 checkpoint download finished is unknown (check `third_party/`) | verify the checkpoint, run the bench, then the speed-ups. SAM 3D Objects access is still pending |
+| Assistant (Groq, `meta-models/muse-spark-open`) | `.env` (gitignored) and `.env.example` exist. **Not built.** The model ID is not verified yet. Development uses an offline fake provider; the live model is used only at the end (`KOLMO_LLM_LIVE=1`) | build after the experiment runner is verified |

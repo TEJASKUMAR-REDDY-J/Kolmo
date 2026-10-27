@@ -1,0 +1,11 @@
+{
+ "name": "diffusion_smoke",
+ "data": {"system": "diffusion", "params": {"n": 32, "kappa": 0.2, "dt": 0.05}, "steps": 60, "spacing": 2,
+          "train_seeds": [0, 1, 2, 3, 4, 5], "val_seeds": [100, 101], "test_seeds": [200, 201, 202],
+          "vary": {"kappa": [0.1, 0.2]}, "heldout": {"kappa": [0.4]}, "cond": ["kappa"]},
+ "models": {
+  "cnn_one_step": {"model": {"kind": "cnn", "width": 16, "depth": 3}, "steps": 600, "batch": 8, "eval_every": 100},
+  "cnn_rollout": {"model": {"kind": "cnn", "width": 16, "depth": 3}, "unroll": 4, "steps": 600, "batch": 8, "eval_every": 100}
+ },
+ "hybrid": [{"mode": "surrogate"}, {"every": 10}, {"every": 4}, {"residual_tol": 0.5}, {"energy_tol": 0.05}]
+}
