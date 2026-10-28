@@ -23,7 +23,7 @@ BASE = "runs/kolmogorov64_long_horizon-88294366/checkpoints"
 MODELS = {"jepa_latent": lambda: latent.load("runs/latent_kolmogorov64/jepa/latent")[0],
           "cnn_rollout4": lambda: train.load(f"{BASE}/cnn_rollout4")[0],
           "cnn_one_step": lambda: train.load(f"{BASE}/cnn_one_step")[0]}
-POLICIES = [HybridPolicy("surrogate")] + [HybridPolicy(every=k) for k in (20, 10, 5, 2)] + [HybridPolicy(energy_tol=0.2)]
+POLICIES = [HybridPolicy("surrogate")] + [HybridPolicy(every=k) for k in (20, 10, 5, 2)] + [HybridPolicy(energy_tol=0.2), HybridPolicy(residual_tol=0.5)]  # reference 10-step residual ~0.06, surrogates 0.45-0.55
 
 
 def main(out="runs/latent_hybrid_study"):

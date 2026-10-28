@@ -78,3 +78,58 @@ One training seed per model, 8 + 4 evaluation trajectories, 2000 steps (about 5 
 tuning of the EMA rate, VICReg weights, latent size or K. Not tried: longer latent unrolls (K > 4) or periodic
 re-encoding inside the latent rollout, which are the obvious next tests. TTF is censored at 200 steps.
 Hybrid policies were not evaluated on Fluid2D (they work in the test).
+
+## Hybrid study: error vs solver cost
+
+`PYTHONPATH=. python benchmarks/latent_hybrid_study.py` (results: `runs/latent_hybrid_study/results.json`, plot
+`runs/latent_hybrid_study/pareto.png` = `docs/images/pareto.png`). Same 8 test trajectories, 200 steps (12 time units).
+Policies are `kolmo.hybrid`: `every k` = one solver step (10 solver substeps) every k surrogate steps, taken from the
+current hybrid state (it is not reset to the true trajectory); for the latent model the next step re-encodes that
+solver state. `E>0.2` = energy-drift trigger. `res>0.5` = residual trigger. The 10-step reference residual is ~0.06 here
+(0.05-0.07), and surrogate proposals sit at 0.43-0.55, so 0.05 rejected every proposal (cost 1.0); 0.5 is the
+informative setting. Errors: median over trajectories of relL2(t), then the max / mean over t = 1..200. Wall time:
+trajectory 0, compile excluded, reference and all policies interleaved, 3 repeats, median. Reference: 0.130 s per
+time unit (repeats 1.67 / 1.50 / 1.56 s).
+
+| model | policy | max relL2 | mean relL2 | solver fraction | nonphysical steps | s per time unit | speedup |
+|---|---|---|---|---|---|---|---|
+| jepa_latent | surrogate | 178 | 23.7 | 0 | 610 | 0.0083 | 15.6 |
+| jepa_latent | every 20 | 3.50 | 1.89 | 0.121* | 162 | 0.031 | 4.2 |
+| jepa_latent | every 10 | 1.58 | 1.30 | 0.10 | 0 | 0.023 | **5.7** |
+| jepa_latent | every 5 | 1.39 | 1.18 | 0.20 | 0 | 0.036 | 3.6 |
+| jepa_latent | every 2 | 1.41 | 1.19 | 0.50 | 0 | 0.074 | 1.75 |
+| jepa_latent | E>0.2 | 1.57 | 1.33 | 0.167 | 0 | 0.056 | 2.3 |
+| jepa_latent | res>0.5 | 1.80 | 1.25 | 0.467 | 0 | 0.526 | 0.25 |
+| cnn_rollout4 | surrogate | 2.20 | 1.40 | 0 | 0 | 0.103 | 1.26 |
+| cnn_rollout4 | every 20 | 1.77 | 1.35 | 0.05 | 0 | 0.096 | 1.35 |
+| cnn_rollout4 | every 10 | 1.71 | 1.31 | 0.10 | 0 | 0.101 | 1.28 |
+| cnn_rollout4 | every 5 | 1.61 | 1.25 | 0.20 | 0 | 0.094 | 1.38 |
+| cnn_rollout4 | every 2 | 1.29 | 1.13 | 0.50 | 0 | 0.108 | 1.20 |
+| cnn_rollout4 | E>0.2 | 1.42 | 1.18 | 0.681 | 0 | 0.132 | 0.99 |
+| cnn_rollout4 | res>0.5 | 1.35 | 1.21 | 0.371 | 0 | 0.496 | 0.26 |
+| cnn_one_step | surrogate | 1506 | 123 | 0 | 689 | 0.081 | 1.61 |
+| cnn_one_step | every 20 | 1.44 | 1.25 | 0.05 | 0 | 0.087 | 1.48 |
+| cnn_one_step | every 10 | 1.45 | 1.24 | 0.10 | 0 | 0.103 | 1.26 |
+| cnn_one_step | every 5 | 1.44 | 1.23 | 0.20 | 0 | 0.093 | 1.39 |
+| cnn_one_step | every 2 | 1.36 | 1.20 | 0.50 | 0 | 0.113 | 1.14 |
+| cnn_one_step | E>0.2 | 1.42 | 1.23 | 0.29 | 0 | 0.126 | 1.03 |
+| cnn_one_step | res>0.5 | 1.55 | 1.27 | 0.017 | 0 | 0.459 | 0.28 |
+
+\* above 0.05 because non-finite latent proposals trigger extra solver steps.
+
+![error vs solver cost](images/pareto.png)
+
+Findings:
+- No policy improves accuracy over 200 steps. Every hybrid lands at a mean relL2 of 1.13-1.35, against ~1.41 for a
+  decorrelated state with the right energy and ~0.97 for climatology. The solver advances the hybrid state rather than
+  the truth, so once the flow decorrelates (~5-10 steps) the error is set by chaos, not by the surrogate. Hybrids buy
+  boundedness: non-physical steps drop to 0 for every model at k <= 10.
+- The trade-off is in cost, not error. CNN steps cost about as much as the 10 solver substeps they replace on this CPU
+  (pure CNN only 1.3-1.6x). JEPA latent + re-anchor every 10 is bounded, energy-consistent and 5.7x faster than the
+  reference at the same error as any CNN hybrid. That is the Pareto point.
+- Re-anchoring needs k <= 10 for the latent model (k = 20 still blows up, consistent with failure at ~10 steps).
+- The residual trigger is the most expensive policy here (0.25-0.28x reference speed), because evaluating the residual
+  costs more than the step it guards. It is also badly separated: CNN one-step proposals pass it 98% of the time, and
+  it does not beat fixed re-anchoring.
+- To get accuracy, not just boundedness, re-anchoring must use observed or true states (data assimilation). This
+  kolmo.hybrid mode does not do that.
