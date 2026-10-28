@@ -36,6 +36,22 @@ def _planes(z, c, pos):
     return jnp.moveaxis(jnp.concatenate(parts, 1), 1, -1)  # (B, H, W, C + P + 4 pos) for flax
 
 
+class PeriodicConv(nn.Module):
+    """'same' convolution on a periodic grid (wrap padding), NHWC, weights (k, k, in, out) + bias."""
+    features: int
+    kernel: int = 3
+    zero: bool = False
+
+    @nn.compact
+    def __call__(self, h):
+        k, p = self.kernel, self.kernel // 2
+        init = nn.initializers.zeros if self.zero else nn.initializers.lecun_normal()
+        w = self.param("kernel", init, (k, k, h.shape[-1], self.features))
+        b = self.param("bias", nn.initializers.zeros, (self.features,))
+        h = jnp.pad(h, ((0, 0), (p, p), (p, p), (0, 0)), mode="wrap")
+        return jax.lax.conv_general_dilated(h, w, (1, 1), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + b
+
+
 class ResCNN(nn.Module):
     """`depth` periodic 'same' convolutions (kernel x kernel, `width` channels, GELU), then a zero-init conv to C."""
     width: int = 32
@@ -45,11 +61,10 @@ class ResCNN(nn.Module):
 
     @nn.compact
     def __call__(self, z, c):
-        h, p = _planes(z, c, self.pos), self.kernel // 2
-        wrap = lambda a: jnp.pad(a, ((0, 0), (p, p), (p, p), (0, 0)), mode="wrap")
+        h = _planes(z, c, self.pos)
         for _ in range(self.depth):
-            h = nn.gelu(nn.Conv(self.width, (self.kernel, self.kernel), padding="VALID")(wrap(h)))
-        dz = nn.Conv(z.shape[1], (self.kernel, self.kernel), padding="VALID", kernel_init=nn.initializers.zeros)(wrap(h))
+            h = nn.gelu(PeriodicConv(self.width, self.kernel)(h))
+        dz = PeriodicConv(z.shape[1], self.kernel, zero=True)(h)
         return z + jnp.moveaxis(dz, -1, 1)
 
 
@@ -96,6 +111,8 @@ def build(arch: dict) -> nn.Module:
     """arch = {"kind": "cnn" | "fno", **constructor kwargs}."""
     a = dict(arch)
     kind = a.pop("kind")
+    if kind == "latent" and kind not in ARCHS:
+        from . import latent  # noqa: F401  registers the JEPA-style latent model
     if kind not in ARCHS:
         raise ValueError(f"unknown model kind {kind!r}; known: {sorted(ARCHS)}")
     return ARCHS[kind](**a)

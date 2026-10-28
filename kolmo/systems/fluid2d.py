@@ -297,8 +297,10 @@ class Fluid2D:
         and sponge contribution exactly as the reference scheme applies it. Norms are L2 over the grid. The
         denominator is the size of the whole balance, so r stays meaningful for steady states (Dw -> 0). For the
         reference solver r is O(dt^2) (trapezoid vs RK3 on N) plus float32 round-off, and exactly 0 for purely
-        linear decay; it measures physical consistency of a transition, not prediction error."""
-        p = self.validate(params)
+        linear decay; it measures physical consistency of a transition, not prediction error. The transition may span
+        more than one stable solver step (a surrogate stride): the CFL limit is not applied here, only to stepping."""
+        p = self.validate({**params, "dt": None})
+        p["dt"] = float(params["dt"]) if params.get("dt") is not None else p["dt"]
         g, q, split = self._setup(p)
         w0, w1 = (jnp.fft.rfft2(jnp.asarray(s, jnp.float32)[0]) * g["dealias"] for s in (prev, nxt))
         wt = self._split(w0, q, g) if split else w0

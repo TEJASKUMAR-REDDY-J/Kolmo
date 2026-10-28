@@ -73,11 +73,14 @@ def train(ds, cfg: TrainConfig, verbose=True):
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(optax.cosine_decay_schedule(cfg.lr, cfg.steps)))
     opt_state = opt.init(params)
 
+    # ponytail: Python loops, not lax.scan: on XLA CPU (JAX 0.7.1) convolutions inside a loop ran ~90x slower
+    # (measured: 5-layer 64x64 CNN gradient 11.7 s in lax.scan vs 0.13 s straight-line). Compile time grows with K, H.
     def loss_fn(p, z, c, targets):  # targets (B, K, C, H, W)
-        def body(z, tgt):
+        losses = []
+        for k in range(targets.shape[1]):
             z = net.apply(p, jax.lax.stop_gradient(z) if cfg.pushforward else z, c)
-            return z, jnp.mean((z - tgt) ** 2)
-        return jax.lax.scan(body, z, jnp.moveaxis(targets, 1, 0))[1].mean()
+            losses.append(jnp.mean((z - targets[:, k]) ** 2))
+        return jnp.mean(jnp.stack(losses))
 
     @jax.jit
     def update(p, o, z, c, targets):
@@ -87,10 +90,11 @@ def train(ds, cfg: TrainConfig, verbose=True):
 
     @jax.jit
     def val_error(p):
-        def body(z, _):
+        z, preds = V0, []
+        for _ in range(H):
             z = net.apply(p, z, Vc)
-            return z, z
-        pred = jnp.moveaxis(jax.lax.scan(body, V0, None, length=H)[1], 0, 1) * std + mean  # (Nv, H, C, H, W)
+            preds.append(z)
+        pred = jnp.stack(preds, 1) * std + mean  # (Nv, H, C, H, W)
         err = jnp.sqrt(((pred - Vref) ** 2).sum((2, 3, 4)) / (Vref ** 2).sum((2, 3, 4)))
         return jnp.where(jnp.isfinite(err), err, 1e3).mean()
 

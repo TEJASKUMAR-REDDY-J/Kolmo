@@ -1,0 +1,86 @@
+{
+    "name":  "kolmogorov64_fno",
+    "data":  {
+                 "system":  "fluid2d",
+                 "params":  {
+                                "n":  64,
+                                "nu":  0.002,
+                                "mu":  0.05,
+                                "A":  1.0,
+                                "kf":  4,
+                                "ic_amp":  1.0,
+                                "dt":  0.006
+                            },
+                 "steps":  200,
+                 "spacing":  10,
+                 "burn_in":  2000,
+                 "train_seeds":  [
+                                     0,
+                                     1,
+                                     2,
+                                     3,
+                                     4,
+                                     5,
+                                     6,
+                                     7,
+                                     8,
+                                     9
+                                 ],
+                 "val_seeds":  [
+                                   100,
+                                   101
+                               ],
+                 "test_seeds":  [
+                                    200,
+                                    201,
+                                    202,
+                                    203
+                                ],
+                 "vary":  {
+                              "nu":  [
+                                         0.002,
+                                         0.003
+                                     ]
+                          },
+                 "heldout":  {
+                                 "nu":  [
+                                            0.005
+                                        ]
+                             },
+                 "cond":  [
+                              "nu"
+                          ]
+             },
+    "models":  {
+                   "fno_one_step":  {
+                                        "model":  {
+                                                      "kind":  "fno",
+                                                      "width":  24,
+                                                      "modes":  12,
+                                                      "depth":  4,
+                                                      "pos":  4
+                                                  },
+                                        "unroll":  1,
+                                        "steps":  2000,
+                                        "batch":  8,
+                                        "lr":  0.001,
+                                        "eval_every":  200,
+                                        "val_horizon":  20,
+                                        "patience":  5,
+                                        "max_minutes":  20
+                                    }
+               },
+    "hybrid":  [
+                   {
+                       "mode":  "surrogate"
+                   },
+                   {
+                       "every":  10
+                   },
+                   {
+                       "every":  2
+                   }
+               ],
+    "eval_steps":  200,
+    "threshold":  0.5
+}
