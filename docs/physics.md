@@ -160,9 +160,9 @@ Cylinder (staircase disc at x = L/4; Cd from the penalisation force, normalised 
 | 192 | 15 | 0.982 | 0.016 | 2.224 | 0.041 | 0.027 |
 | 256 | 20 | 1.031 | 0.012 | 2.165 | 0.046 | 0.021 |
 
-(n = 96 and 256 rows come from a separate run of the same setup, not from the test.) Cd settles to < 1e-3 by
-t ~ 15. What this shows, honestly: Cd lies in 2.10-2.23, i.e. ~3-10 % above the unbounded-cylinder literature value
-of about 2.0-2.1 at Re = 20, which is the expected direction for 8 % blockage in a periodic array; Cl is zero to
+(n = 96 and 256 rows come from a separate run of the same setup, not from the test.) Cd changes by
+< 0.1 % between t = 15 and t = 20. What this shows, honestly: Cd lies in 2.10-2.23, i.e. ~2-9 % above the commonly
+quoted value of about 2.05 at Re = 20 (not re-derived here), which is the expected direction for 8 % blockage in a periodic array; Cl is zero to
 round-off as the symmetric steady wake requires; the leakage inside the body falls roughly like dx. There is no
 clean monotone convergence of Cd: it is dominated by the staircase extent D (which jumps between 0.92 and 1.08 as n
 changes), and at identical mask extent (n = 64 vs 192) Cd changed by +2.1 %. Converged-geometry studies need a

@@ -92,7 +92,7 @@ def test_batched_stepper_matches_single():
 
 def test_penalised_cylinder():
     """Re = U D / nu = 20 cylinder of nominal D = 1 in a 4 pi box (blockage ~8 %, periodic array), sponge 10 %,
-    t = 20 (Cd settled to < 1e-3). n = 64 and 192 are compared because their staircase masks have the same
+    t = 20 (Cd changes < 0.1 % over the last 5 time units). n = 64 and 192 are compared because their staircase masks have the same
     cross-stream extent (D = 0.982); at other n the staircase D jumps by up to 10 % and dominates the Cd change."""
     L, out = 4 * math.pi, {}
     for n in (64, 192):

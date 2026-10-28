@@ -44,7 +44,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()
-    win.resize(1600, 980)
+    win.resize(1680, 1000)
     win.show()
     app.processEvents()
     select_system(win, "diffusion")
@@ -63,10 +63,10 @@ def main():
     assert win.xs == list(range(301)), len(win.xs)
     var = win.diag_ref["variance"]
     assert len(var) == 301 and var[-1] < var[0], "diffusion must dissipate variance"
-    t = win.rt["reference"][1].text()
-    assert t != "—", "steady-state step time must be measured"
+    t = win.timing["reference"]
+    assert t.per_step, "steady-state step time must be measured"
     print(f"diffusion reference: {len(win.xs) - 1} steps, variance {var[0]:.4g} -> {var[-1]:.4g}, "
-          f"{t} ms/step steady, first call {win.rt['reference'][2].text()} s")
+          f"{1e3 * t.per_step:.3f} ms/step steady, first call {t.first_call:.2f} s")
     shot(win, "02_diffusion_reference.png")
 
     # pause mid-run: stepping stops while the UI stays live; reset stops the run
@@ -103,8 +103,8 @@ def main():
         wait(app, lambda: win.runner is None)
         assert win.pill.text() == "Finished", (win.pill.text(), win.run_error.text())
         assert win.cand_view.image is not None and win.err_view.image is not None and len(win.err) == 61
-        print(f"surrogate: rel L2 step 1 {win.err[1]:.3g}, step 60 {win.err[-1]:.3g}; ms/step ref "
-              f"{win.rt['reference'][1].text()} surrogate {win.rt['candidate'][1].text()}; {win.speedup.text()}")
+        print(f"surrogate: rel L2 step 1 {win.err[1]:.3g}, step 60 {win.err[-1]:.3g}; speedup card "
+              f"{win.m_speed.value} ({win.m_speed.caption}); horizon {win.m_horizon.value}")
         print("diagnosis:", win.findings.toPlainText()[:600].replace("\n", " | "))
         shot(win, "04_surrogate.png")
         win.mode_group.button(2).click()
@@ -116,6 +116,12 @@ def main():
         print(f"hybrid every 10: rel L2 max {max(win.err):.3g}, interventions {len(win.err_chart.vlines)}")
         print("diagnosis:", win.findings.toPlainText()[:400].replace("\n", " | "))
         shot(win, "04_hybrid.png")
+        win.side_tabs.button(1).click()
+        shot(win, "04_hybrid_assistant.png")
+        win.side_tabs.button(0).click()
+        win.nav.button(1).click()
+        shot(win, "07_experiments.png")
+        win.nav.button(0).click()
     win.mode_group.button(0).click()
 
     # Fluid 2D reference, Kolmogorov-forced defaults, when the solver module is present
@@ -126,8 +132,9 @@ def main():
         wait(app, lambda: win.runner is None)
         assert win.pill.text() == "Finished", (win.pill.text(), win.run_error.text())
         e = win.diag_ref["energy"]
+        t = win.timing["reference"]
         print(f"fluid2d reference: {len(win.xs) - 1} steps, energy {e[0]:.4g} -> {e[-1]:.4g}, "
-              f"{win.rt['reference'][1].text()} ms/step steady, first call {win.rt['reference'][2].text()} s")
+              f"{1e3 * t.per_step:.3f} ms/step steady, first call {t.first_call:.2f} s")
         shot(win, "05_fluid_reference.png")
 
         # flow past a built-in cylinder: free stream on, forcing off, Re from U_inf and the body size

@@ -49,6 +49,42 @@ def failure_threshold():
     return inspect.signature(m.time_to_failure).parameters["threshold"].default if m else 0.5
 
 
+def drift_tol():
+    """|energy drift| above which kolmo.diagnose reports it (DRIFT_TOL)."""
+    m, _ = _import("kolmo.diagnose")
+    return getattr(m, "DRIFT_TOL", 0.05)
+
+
+def device():
+    """'Local (CPU)' etc. from JAX's default device."""
+    import jax
+    return f"Local ({jax.devices()[0].platform.upper()})"
+
+
+def experiments():
+    """Experiment run directories written by kolmo.experiments, newest first:
+    [{"name", "dir", "rows" (evaluate.table), "n_findings", "report" (path or None), "runtime"}]."""
+    ev = _import("kolmo.evaluate")[0]
+    root, out = ROOT / "runs", []
+    for res in sorted(root.glob("*/results.json"), key=lambda p: p.stat().st_mtime, reverse=True) if root.is_dir() else []:
+        try:
+            results = json.loads(res.read_text(encoding="utf-8"))
+            diag = res.parent / "diagnosis.json"
+            n = len(json.loads(diag.read_text(encoding="utf-8"))) if diag.exists() else 0
+        except (OSError, ValueError):
+            continue
+        rep = res.parent / "report.md"
+        out.append({"name": res.parent.name, "dir": str(res.parent), "rows": ev.table(results) if ev else [],
+                    "n_findings": n, "report": str(rep) if rep.exists() else None,
+                    "runtime": {m: r.get("runtime", {}) for m, r in results.items()}})
+    return out
+
+
+def all_checkpoints():
+    """[(system label, checkpoint label, stem)] over every available system."""
+    return [(lbl, c, stem) for lbl, s, _ in systems() if s is not None for c, stem in checkpoints(s)]
+
+
 # ---------------------------------------------------------------- systems and parameters
 
 @dataclass
@@ -304,12 +340,22 @@ class LiveRun:
             self.spacing = int(self.surrogate.spacing)
             if list(self.meta.get("fields", self.system.fields)) != list(self.system.fields):
                 raise ValueError(f"checkpoint fields {self.meta.get('fields')} do not match {self.system.fields}")
+            # first call = compilation, timed as such; it also catches checkpoints the current model code cannot apply
+            probe = self.surrogate.stepper(self.params)
+            t0 = time.perf_counter()
+            try:
+                probe(self.system.initial(self.params, self.seed)).block_until_ready()
+            except Exception as e:  # noqa: BLE001
+                raise Unavailable(f"Checkpoint {Path(str(cfg.get('checkpoint'))).name} does not run with the current "
+                                  f"kolmo.surrogates code ({type(e).__name__}: {str(e)[:160]}). Retrain it with "
+                                  "python -m kolmo.experiments run <config.json>.") from None
+            self.timing["candidate"].first_call = time.perf_counter() - t0
         if self.mode == "hybrid":
             self.policy = make_policy(cfg.get("policy"))
         elif self.mode not in ("reference", "surrogate"):
             raise ValueError(f"unknown mode {self.mode!r}")
         self._ref_step = _need("kolmo.rollout").coarse(self.system.stepper(self.params), self.spacing)
-        self._net = self.surrogate.stepper(self.params) if self.mode == "surrogate" else None
+        self._net = probe if self.mode == "surrogate" else None  # already compiled
         n_vals = int(np.prod(self.system.initial(self.params, self.seed).shape))
         self.keep = 8 * (self.steps + 1) * n_vals <= KEEP_STATES_BYTES  # float32, two trajectories
         self.ref_states, self.cand_states, self.events = [], [], []
