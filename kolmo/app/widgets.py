@@ -90,8 +90,8 @@ class Backdrop(QWidget):
     """Animated 'fabric': slow drifting light ribbons over an indigo gradient, computed with numpy at 96 x 56 and
     smoothly upscaled; a 4x smaller copy is the frosted backdrop of every Glass card.
     Cost control: 6 fps; a frame repaints only the gaps between cards; cards re-sample the blurred backdrop every
-    5 s (one full repaint); paused when switched off, held (during runs), hidden, minimised or inactive."""
-    W, H, FPS, BLUR_EVERY = 96, 56, 6, 30
+    1 s (one full repaint); paused when switched off, held (during runs), hidden, minimised or inactive."""
+    W, H, FPS, BLUR_EVERY = 96, 56, 6, 6  # cards re-sample the backdrop every second: slower refresh shows as a lagging card outline
     RIBBONS = (((0.30, 0.10, 2.1, 0.0, 0.07), (124, 92, 255)), ((0.62, 0.13, 1.6, 2.0, 0.09), (176, 90, 230)),
                ((0.85, 0.08, 2.7, 4.1, 0.06), (70, 110, 255)), ((0.12, 0.07, 3.3, 1.3, 0.05), (220, 110, 255)))
     instance = None
@@ -123,8 +123,9 @@ class Backdrop(QWidget):
         else:
             gaps = QRegion(self.rect())
             for c in self.findChildren(Glass):
-                if c.level == 0 and c.isVisible():
-                    gaps -= QRegion(QRect(c.mapTo(self, QPoint(0, 0)), c.size()))
+                if c.level == 0 and c.isVisible():  # skip only the card's interior: its rounded corners show the live backdrop
+                    rc, k = QRect(c.mapTo(self, QPoint(0, 0)), c.size()), int(c.radius) + 1
+                    gaps -= QRegion(rc.adjusted(k, 0, -k, 0)) | QRegion(rc.adjusted(0, k, 0, -k))
             self.update(gaps)
 
     def _render(self):

@@ -73,7 +73,9 @@ def run(cfg: ExperimentConfig, verbose=True):
         if os.path.exists(ck + ".json"):
             with open(ck + ".json") as f:
                 meta = json.load(f)
-        if meta and meta["train"] == asdict(tc) and meta["data_hash"] == ds.hash:
+        if tc.init_from in results:  # an earlier model of this experiment
+            tc = train.TrainConfig(**{**asdict(tc), "init_from": f"{out}/checkpoints/{tc.init_from}"})
+        if meta and train.TrainConfig(**meta["train"]) == tc and meta["data_hash"] == ds.hash:
             sur, meta = train.load(ck)
             if verbose:
                 print(f"model {name}: reusing {ck}")

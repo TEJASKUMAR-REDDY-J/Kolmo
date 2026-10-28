@@ -1,12 +1,13 @@
 """Photo -> obstacle grid on synthetic drawn shapes (no downloads, no SAM 3)."""
 import json
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
 from kolmo.geometry.mask import clean, mask_to_grid
-from kolmo.geometry.segment import GrabCutSegmenter, parse_prompt
+from kolmo.geometry.segment import GrabCutSegmenter, Sam3Segmenter, parse_prompt
 
 
 def rect(w, h, angle=0.0, size=(600, 800)):
@@ -114,3 +115,37 @@ def test_parse_prompt():
     assert parse_prompt("10,20") == (10, 20) and parse_prompt("1,2,3,4") == (1, 2, 3, 4)
     with pytest.raises(ValueError):
         parse_prompt("1,2,3")
+
+
+SAMPLES = Path(__file__).resolve().parents[1] / "docs" / "samples"
+
+
+def photo_to_flow(segmenter, prompt):
+    """docs/samples/car.jpg -> mask -> 64^2 obstacle -> 10 Fluid2D steps; returns (grid, meta, diagnostics)."""
+    jax = pytest.importorskip("jax")  # noqa: F841  the solver needs it
+    from kolmo.systems.fluid2d import Fluid2D
+    img = cv2.cvtColor(cv2.imread(str(SAMPLES / "car.jpg")), cv2.COLOR_BGR2RGB)
+    grid, meta = mask_to_grid(segmenter.segment(img, prompt), n=64, chord=0.3)
+    S = Fluid2D()
+    p = S.validate({"n": 64, "L": 4 * np.pi, "mask": np.flipud(grid), "U_inf": 1.0, "Re": 20})
+    tr = S.rollout(p, S.initial(p, 0), 10, every=10)
+    return grid, meta, S.diagnostics(tr.states[-1], p)
+
+
+def test_photo_to_flow_grabcut():
+    grid, meta, d = photo_to_flow(GrabCutSegmenter(), "car")
+    assert meta["chord_cells"] == 19 and 4 <= meta["frontal_height_cells"] <= 9
+    assert np.isfinite(d["cd"]) and d["cd"] > 0
+
+
+@pytest.mark.skipif(not Sam3Segmenter.available(), reason="SAM 3 venv/weights not installed (docs/geometry.md)")
+def test_photo_to_flow_sam3():  # slow (~2-3 min on a 2-core laptop): loads SAM 3.1 and encodes one photo
+    seg = Sam3Segmenter()
+    try:
+        grid, meta, d = photo_to_flow(seg, "car")
+        ref, _, _ = photo_to_flow(GrabCutSegmenter(), "car")
+        # GrabCut is a heuristic, not ground truth: this checks the two segmenters broadly agree (measured IoU 0.78 on
+        # the 64^2 grid, 2026-10-28) and that the SAM mask gives a finite, positive drag
+        assert (grid & ref).sum() / (grid | ref).sum() > 0.7 and np.isfinite(d["cd"]) and d["cd"] > 0
+    finally:
+        seg.close()

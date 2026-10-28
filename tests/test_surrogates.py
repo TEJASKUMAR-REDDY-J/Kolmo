@@ -160,3 +160,26 @@ def test_experiment_end_to_end(tmp_path):
     assert res["one_step"]["hybrid"][1]["cost_fraction"] == 0.5
     with pytest.raises(ValueError):
         experiments.ExperimentConfig(**{**cfg, "models": {"x": {"bogus": 1}}}).parsed()
+
+
+def test_spectrum_and_stats():
+    x = np.arange(16) * 2 * np.pi / 16
+    s = np.cos(3 * x)[None, None, :].repeat(16, 1)  # one mode, |m| = 3
+    sp = evaluate.spectrum(s)
+    assert np.argmax(sp) == 3 and np.isclose(sp.sum(), np.mean(s ** 2))  # Parseval
+    r = np.random.default_rng(0).normal(size=(3, 1, 16, 16))
+    a = evaluate.spectrum(r)
+    assert np.allclose(evaluate.spectrum_error(a, a, 5), 0) and np.allclose(evaluate.spectrum_error(10 * a, a, 5), 1)
+    st = evaluate.rollout_stats([{"e": 2.0}, {"e": 4.0}], [{"e": 1.0}, {"e": 3.0}])
+    assert st["e"]["pred_mean"] == 3 and st["e"]["mean_rel_err"] == 0.5
+
+
+def test_init_from_finetune(ds, tmp_path):
+    cfg = train.TrainConfig(model={"kind": "cnn", "width": 8, "depth": 2}, steps=20, batch=4, eval_every=10)
+    sur, hist = train.train(ds, cfg, verbose=False)
+    train.save(str(tmp_path / "a"), sur, ds, cfg, hist)
+    ft = train.TrainConfig(**{**vars(cfg), "unroll": 2, "lr": 1e-12, "steps": 1, "eval_every": 1,
+                              "init_from": str(tmp_path / "a")})
+    sur2, _ = train.train(ds, ft, verbose=False)
+    s = jnp.asarray(ds.splits["test"].states[0, 0]); p = ds.splits["test"].params[0]
+    assert np.allclose(sur.stepper(p)(s), sur2.stepper(p)(s), atol=1e-5)  # lr ~ 0: weights kept

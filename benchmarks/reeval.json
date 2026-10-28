@@ -1,0 +1,154 @@
+{
+    "name":  "kolmogorov64_reeval",
+    "data":  {
+                 "system":  "fluid2d",
+                 "params":  {
+                                "n":  64,
+                                "nu":  0.002,
+                                "mu":  0.05,
+                                "A":  1.0,
+                                "kf":  4,
+                                "ic_amp":  1.0,
+                                "dt":  0.006
+                            },
+                 "steps":  200,
+                 "spacing":  10,
+                 "burn_in":  2000,
+                 "train_seeds":  [
+                                     0,
+                                     1,
+                                     2,
+                                     3,
+                                     4,
+                                     5,
+                                     6,
+                                     7,
+                                     8,
+                                     9
+                                 ],
+                 "val_seeds":  [
+                                   100,
+                                   101
+                               ],
+                 "test_seeds":  [
+                                    200,
+                                    201,
+                                    202,
+                                    203
+                                ],
+                 "vary":  {
+                              "nu":  [
+                                         0.002,
+                                         0.003
+                                     ]
+                          },
+                 "heldout":  {
+                                 "nu":  [
+                                            0.005
+                                        ]
+                             },
+                 "cond":  [
+                              "nu"
+                          ]
+             },
+    "models":  {
+                   "cnn_one_step":  {
+                                        "model":  {
+                                                      "kind":  "cnn",
+                                                      "width":  32,
+                                                      "depth":  4,
+                                                      "pos":  4
+                                                  },
+                                        "unroll":  1,
+                                        "steps":  2000,
+                                        "batch":  8,
+                                        "lr":  0.001,
+                                        "eval_every":  200,
+                                        "val_horizon":  20,
+                                        "patience":  5,
+                                        "max_minutes":  20
+                                    },
+                   "cnn_rollout4":  {
+                                        "model":  {
+                                                      "kind":  "cnn",
+                                                      "width":  32,
+                                                      "depth":  4,
+                                                      "pos":  4
+                                                  },
+                                        "unroll":  4,
+                                        "steps":  2000,
+                                        "batch":  8,
+                                        "lr":  0.001,
+                                        "eval_every":  200,
+                                        "val_horizon":  20,
+                                        "patience":  5,
+                                        "max_minutes":  20
+                                    },
+                   "fno_one_step":  {
+                                        "model":  {
+                                                      "kind":  "fno",
+                                                      "width":  24,
+                                                      "modes":  12,
+                                                      "depth":  4,
+                                                      "pos":  4
+                                                  },
+                                        "unroll":  1,
+                                        "steps":  2000,
+                                        "batch":  8,
+                                        "lr":  0.001,
+                                        "eval_every":  200,
+                                        "val_horizon":  20,
+                                        "patience":  5,
+                                        "max_minutes":  20
+                                    },
+                   "fno_ft_k2":  {
+                                     "model":  {
+                                                   "kind":  "fno",
+                                                   "width":  24,
+                                                   "modes":  12,
+                                                   "depth":  4,
+                                                   "pos":  4
+                                               },
+                                     "unroll":  2,
+                                     "steps":  400,
+                                     "batch":  8,
+                                     "lr":  0.0003,
+                                     "eval_every":  100,
+                                     "val_horizon":  20,
+                                     "patience":  4,
+                                     "max_minutes":  6,
+                                     "init_from":  "fno_one_step"
+                                 },
+                   "fno_ft_k4":  {
+                                     "model":  {
+                                                   "kind":  "fno",
+                                                   "width":  24,
+                                                   "modes":  12,
+                                                   "depth":  4,
+                                                   "pos":  4
+                                               },
+                                     "unroll":  4,
+                                     "steps":  400,
+                                     "batch":  8,
+                                     "lr":  0.0002,
+                                     "eval_every":  100,
+                                     "val_horizon":  20,
+                                     "patience":  4,
+                                     "max_minutes":  10,
+                                     "init_from":  "fno_ft_k2"
+                                 }
+               },
+    "hybrid":  [
+                   {
+                       "mode":  "surrogate"
+                   },
+                   {
+                       "every":  10
+                   },
+                   {
+                       "residual_tol":  0.3
+                   }
+               ],
+    "eval_steps":  200,
+    "threshold":  0.5
+}

@@ -82,9 +82,53 @@ def trajectory_metrics(system, pred, ref, params, spacing, threshold=0.5, blowup
         except ValueError as e:  # e.g. a solver whose validate() refuses dt = spacing * dt (CFL)
             m.pop("residual_pred", None)
             m["residual_unavailable"] = str(e)
-    m["diagnostics"] = {str(h): {"pred": system.diagnostics(pred[h], params) if finite[h] else None,
-                                 "ref": system.diagnostics(ref[h], params)} for h in (0,) + HORIZONS if h <= T}
+    dp = [system.diagnostics(pred[t], params) if finite[t] else None for t in range(T + 1)]
+    dr = [system.diagnostics(ref[t], params) for t in range(T + 1)]
+    m["diagnostics"] = {str(h): {"pred": dp[h], "ref": dr[h]} for h in (0,) + HORIZONS if h <= T}
+    m["stats"] = rollout_stats(dp[1:], dr[1:])
+    kmax = min(pred.shape[-2:]) // 3
+    sp, sr = spectrum(np.where(np.isfinite(pred), pred, np.inf)), spectrum(ref)
+    m["spectrum_err"] = spectrum_error(sp, sr, kmax)
+    m["spectrum_pred_mean"], m["spectrum_ref_mean"] = sp[1:].mean(0), sr[1:].mean(0)
+    m["spectrum_err_timemean"] = float(spectrum_error(m["spectrum_pred_mean"], m["spectrum_ref_mean"], kmax))
     return m
+
+
+def spectrum(states):
+    """Radially averaged power spectrum: sum over channels of |FFT(state)|^2 / (H W)^2 per integer shell
+    k = round(|m|) (m = integer wavenumber vector), k = 0..min(H, W)/2. Shape (..., min(H, W)/2 + 1), units field^2.
+    For vorticity this is the enstrophy-type spectrum Z(k); the energy spectrum is E(k) = Z(k)/k^2 (L = 2 pi), and
+    the log-spectrum error below is identical for both because the 1/k^2 factor cancels."""
+    s = np.asarray(states, np.float64)
+    H, W = s.shape[-2:]
+    with np.errstate(invalid="ignore", over="ignore"):
+        f = (np.abs(np.fft.fft2(s)) ** 2).sum(-3) / (H * W) ** 2
+    my, mx = np.meshgrid(np.fft.fftfreq(H, 1 / H), np.fft.fftfreq(W, 1 / W), indexing="ij")
+    shell = np.rint(np.hypot(mx, my)).astype(int).ravel()
+    flat = f.reshape(f.shape[:-2] + (-1,))
+    return np.stack([flat[..., shell == k].sum(-1) for k in range(min(H, W) // 2 + 1)], -1)
+
+
+def spectrum_error(sp, sr, kmax):
+    """sqrt(mean over shells k = 1..kmax of (log10 sp(k) - log10 sr(k))^2), in decades (dex); kmax = n/3 (the
+    2/3-rule band). 0 = identical spectra, 1 = off by a factor 10 on average. Non-finite -> inf."""
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+        d = np.log10(sp[..., 1:kmax + 1]) - np.log10(sr[..., 1:kmax + 1])
+        e = np.sqrt(np.mean(d * d, -1))
+    return np.where(np.isfinite(e), e, np.inf)
+
+
+def rollout_stats(dp, dr):
+    """Time mean/std over the rollout (steps 1..T) of every system diagnostic (Fluid2D: energy, enstrophy, ...),
+    predicted and reference, and mean_rel_err = pred_mean / ref_mean - 1. Any non-finite predicted state -> inf."""
+    out = {}
+    for k in dr[0]:
+        r = np.array([d[k] for d in dr], np.float64)
+        p = np.array([d[k] if d is not None else np.inf for d in dp], np.float64)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            out[k] = {"pred_mean": p.mean(), "pred_std": p.std(), "ref_mean": r.mean(), "ref_std": r.std(),
+                      "mean_rel_err": p.mean() / r.mean() - 1 if r.mean() else np.inf}
+    return out
 
 
 def summarize(ms, T, threshold):
@@ -111,6 +155,12 @@ def summarize(ms, T, threshold):
                                              max(np.median(out["residual_ref"]["median"]), 1e-30))
     diag = [m["diagnostics"] for m in ms]
     out["diagnostics"] = {h: {who: _mean_dicts([d[h][who] for d in diag]) for who in ("pred", "ref")} for h in diag[0]}
+    out["spectrum_err"] = _agg([m["spectrum_err"] for m in ms])
+    out["spectrum_err_timemean"] = float(np.median([m["spectrum_err_timemean"] for m in ms]))
+    out["spectrum_pred_mean"] = np.median([m["spectrum_pred_mean"] for m in ms], 0)
+    out["spectrum_ref_mean"] = np.median([m["spectrum_ref_mean"] for m in ms], 0)
+    out["stats"] = {k: {f: float(np.median([m["stats"][k][f] for m in ms])) for f in ms[0]["stats"][k]}
+                    for k in ms[0]["stats"]}  # medians over trajectories
     return out
 
 
@@ -180,6 +230,10 @@ def evaluate(system, ds, sur, splits=("test", "heldout"), steps=None, threshold=
     return res
 
 
+def _fmt(v):
+    return "n/a" if v is None or not np.isfinite(v) else f"{v:.3g}"
+
+
 def _count(xs):
     return {x: xs.count(x) for x in sorted(set(xs))}
 
@@ -192,7 +246,11 @@ def table(results):
             rows.append({"model": model, "split": split, "n_traj": s["n_traj"], **{f"relL2@{h}": v for h, v in s["horizons"].items()},
                          "ttf_median": s["time_to_failure"]["median_observed"],
                          "ttf_censored": f"{s['time_to_failure']['censored']}/{s['n_traj']}",
-                         "energy_drift_final": s["energy_drift_final"], "nonphysical_steps": s["nonphysical_steps"]})
+                         "energy_drift_final": s["energy_drift_final"], "nonphysical_steps": s["nonphysical_steps"],
+                         "spectrum_err_dex": s.get("spectrum_err_timemean"),
+                         "residual_ratio": s.get("residual_ratio_median"),
+                         **{f"{k}_mean_rel_err": v["mean_rel_err"] for k, v in s.get("stats", {}).items()
+                            if k in ("energy", "enstrophy", "variance")}})
     return rows
 
 
@@ -246,6 +304,21 @@ def plot(results, outdir):
     ax.set(xlabel="surrogate step", ylabel="mean square of state (median over test trajectories)", title="Energy vs time")
     ax.legend(fontsize=8); fig.tight_layout()
     files.append(f"{outdir}/energy_vs_time.png"); fig.savefig(files[-1], dpi=120); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    first = True
+    for model, r in results.items():
+        s = r["splits"].get("test")
+        if s is None:
+            continue
+        k = np.arange(1, len(s["spectrum_ref_mean"]))
+        if first:
+            ax.loglog(k, np.asarray(s["spectrum_ref_mean"], float)[1:], "k-", lw=2, label="reference")
+            first = False
+        ax.loglog(k, np.asarray(s["spectrum_pred_mean"], float)[1:], label=f"{model} ({_fmt(s['spectrum_err_timemean'])} dex)")
+    ax.set(xlabel="wavenumber shell k", ylabel="time-mean power spectrum of state", title="Spectrum over the rollout (test)")
+    ax.legend(fontsize=8); fig.tight_layout()
+    files.append(f"{outdir}/spectrum.png"); fig.savefig(files[-1], dpi=120); plt.close(fig)
 
     if any(r["hybrid"] for r in results.values()):
         fig, ax = plt.subplots(figsize=(7, 4.5))

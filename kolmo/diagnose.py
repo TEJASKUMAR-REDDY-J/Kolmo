@@ -12,6 +12,8 @@ SHIFT_RATIO = 2.0  # held-out / test error ratio that counts as distribution shi
 RESIDUAL_RATIO = 10.0  # surrogate / reference residual ratio that counts as physically inconsistent
 SAME_RATE = 0.25  # relative difference of growth rates treated as "the same"
 BETTER = 0.8  # error ratio below which one model is called better at a horizon
+SPEC_TOL = 0.1  # dex: time-mean log-spectrum error counted as faithful
+STAT_TOL = 0.1  # relative error of time-mean energy/enstrophy counted as faithful
 
 
 def _arr(x):
@@ -84,6 +86,17 @@ def diagnose_model(model, r):
             {"drift_final": d, "drift_max_abs": test["energy_drift_max_abs"]},
             "spurious energy injection by the surrogate" if up else "spurious dissipation: predictions smooth/blur out",
             "energy-penalty or spectrum loss; check the high-wavenumber spectrum of predictions")
+    se, st = test.get("spectrum_err_timemean"), test.get("stats") or {}
+    rel = {k: st[k]["mean_rel_err"] for k in ("energy", "enstrophy", "variance") if k in st}
+    if se is not None or rel:
+        ok = se is not None and se < SPEC_TOL and all(v is not None and abs(v) < STAT_TOL for v in rel.values())
+        add("info" if ok else "warning",
+            f"rollout statistics over {T} steps: time-mean log-spectrum error {_f(se)} dex (k <= n/3); time-mean "
+            "relative error " + ", ".join(f"{k} {_f(v)}" for k, v in rel.items()),
+            {"spectrum_err_dex": se, "stats": st},
+            "statistically faithful: long rollouts usable for statistics even after pointwise divergence" if ok else
+            "long-rollout statistics are biased: the surrogate drifts to a different attractor or amplitude",
+            "spectrum or energy-statistics loss term; longer rollout-aware training")
     rr = test.get("residual_ratio_median")
     if rr is not None and rr > RESIDUAL_RATIO:
         add("warning", f"median physics residual of surrogate transitions is {rr:.3g}x the reference solver's own",

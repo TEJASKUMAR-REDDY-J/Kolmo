@@ -59,23 +59,29 @@ def openvino_trunk(model, device, int8, outdir, res):
     xml = os.path.join(outdir, f"trunk{'_int8' if int8 else ''}_{res}.xml")
     t = time.perf_counter()
     if not os.path.exists(xml):
-        trunk = model.backbone.vision_backbone.trunk
+        class Last(torch.nn.Module):  # trunk as a registered submodule, so its weights are traced as parameters
+            def __init__(self, trunk):
+                super().__init__()
+                self.trunk = trunk
 
-        class Last(torch.nn.Module):
             def forward(self, x):
-                return trunk(x)[-1]
+                return self.trunk(x)[-1]
 
         with torch.no_grad():
-            ovm = ov.convert_model(Last(), example_input=torch.zeros(1, 3, res, res))
+            ovm = ov.convert_model(Last(model.backbone.vision_backbone.trunk.requires_grad_(False)),
+                                   example_input=torch.zeros(1, 3, res, res))
         if int8:
             import nncf
             ovm = nncf.compress_weights(ovm)  # int8 weight-only (asymmetric, per-channel) by default
         ov.save_model(ovm, xml, compress_to_fp16=False)
     convert_s = time.perf_counter() - t
     core = ov.Core()
+    core.set_property({"CACHE_DIR": os.path.join(outdir, "ov_cache")})  # compiled kernels reused across runs
     t = time.perf_counter()
     cfg = {"INFERENCE_PRECISION_HINT": "f16"} if device == "GPU" else {"INFERENCE_PRECISION_HINT": "f32"}
-    compiled = core.compile_model(xml, device, cfg)
+    m = core.read_model(xml)
+    m.reshape({m.inputs[0]: [1, 3, res, res]})  # static shape: GPU kernels built at compile time (and cached), not on 1st call
+    compiled = core.compile_model(m, device, cfg)
     return compiled, convert_s, time.perf_counter() - t
 
 

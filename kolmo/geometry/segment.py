@@ -7,10 +7,13 @@ A prompt is one of
 
 `get_segmenter("auto")` returns SAM 3 when its code and weights are installed (see docs/geometry.md),
 otherwise the OpenCV GrabCut fallback, so the pipeline always works."""
+import atexit
+import hashlib
 import json
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Protocol, Union
 
@@ -27,6 +30,7 @@ SAM3_CHECKPOINT = next((p for p in (THIRD_PARTY / "weights" / "sam3.1" / "sam3.1
                         if p.exists()), SAM3_WEIGHTS / "sam3.pt")
 SAM3_PYTHON = THIRD_PARTY / "venv-sam3" / "Scripts" / "python.exe"
 BRIDGE = Path(__file__).with_name("sam3_bridge.py")
+OV_ENCODER = THIRD_PARTY / "weights" / "sam3.1" / "ov" / "trunk_1008.xml"  # made by sam3_bench.py ov-gpu (fp16 on iGPU)
 
 
 class Segmenter(Protocol):
@@ -53,6 +57,8 @@ class GrabCutSegmenter:
 
     def segment(self, image, prompt=None):
         image = _check_image(image)
+        if isinstance(prompt, dict):  # {"text", "point", "box"}: GrabCut can only use the geometry
+            prompt = prompt.get("box") or prompt.get("point") or prompt.get("text")
         H, W = image.shape[:2]
         s = min(1.0, self.max_side / max(H, W))  # ponytail: GrabCut on a <=512 px copy; edges upsampled, ~1 px error
         small = cv2.resize(image, (max(1, round(W * s)), max(1, round(H * s))), interpolation=cv2.INTER_AREA) if s < 1 else image
@@ -83,45 +89,93 @@ class GrabCutSegmenter:
 
 
 class Sam3Segmenter:
-    """Meta SAM 3 (facebook/sam3), run locally. The model lives in its own venv (third_party/venv-sam3) so the
-    base environment's numpy/torch stay untouched; each call goes through `sam3_bridge.py` in a subprocess.
-    Loaded lazily: nothing happens until the first `segment`. Returns the highest-scoring instance mask."""
+    """Meta SAM 3.1 / SAM 3, run locally. The model lives in its own venv (third_party/venv-sam3) so the base
+    environment's numpy/torch stay untouched. A `sam3_bridge.py` server process is started on the first call and
+    kept alive: the model loads once (~30 s) and the photo's image embedding is cached, so re-prompting the same
+    photo (other text, a click) costs only the prompt (~15-20 s on a 2-core laptop) instead of the encoder too.
+    Extra prompt form: a dict {"text": "car", "point": (x, y), "box": (x0, y0, x1, y1)} (any subset).
+    `progress(msg)` is called before each slow step. encoder: "torch" | "ov-cpu" | "ov-gpu" | "auto"
+    ("auto" = OpenVINO encoder, fp16 on the iGPU, when its converted XML exists, else torch)."""
     name = "sam3"
 
-    def __init__(self, python=SAM3_PYTHON, checkpoint=SAM3_CHECKPOINT, threshold=0.4, resolution=None,
-                 dtype="fp32", threads=None):
+    def __init__(self, python=SAM3_PYTHON, checkpoint=SAM3_CHECKPOINT, threshold=0.4, encoder="auto", threads=None,
+                 progress=None):
         self.python, self.checkpoint = Path(python), Path(checkpoint)
-        self.threshold, self.resolution, self.dtype, self.threads = threshold, resolution, dtype, threads
-        self.last_info = {}
+        self.threshold, self.threads, self.progress = threshold, threads, progress or (lambda msg: None)
+        self.encoder = encoder if encoder != "auto" else ("ov-gpu" if OV_ENCODER.exists() else "torch")
+        self.last_info, self._proc, self._image_key = {}, None, None
+        self._lock = threading.Lock()
+        self._tmp = tempfile.mkdtemp(prefix="kolmo_sam3_")
 
     @staticmethod
     def available(python=SAM3_PYTHON, checkpoint=SAM3_CHECKPOINT):
         return Path(python).exists() and Path(checkpoint).exists() and (SAM3_CODE / "sam3").is_dir()
 
-    def segment(self, image, prompt=None):
-        image = _check_image(image)
+    def _call(self, req):
+        self._proc.stdin.write(json.dumps(req) + "\n")
+        self._proc.stdin.flush()
+        return self._read()
+
+    def _read(self):
+        line = self._proc.stdout.readline()
+        if not line:
+            self.close()
+            raise RuntimeError(f"SAM 3 server exited; see {self._tmp}/bridge.log")
+        r = json.loads(line)
+        if "error" in r:
+            raise RuntimeError(f"SAM 3: {r['error']}")
+        return r
+
+    def _start(self):
         if not self.available(self.python, self.checkpoint):
             raise RuntimeError("SAM 3 is not installed: see docs/geometry.md (venv, code and checkpoint)")
-        with tempfile.TemporaryDirectory() as tmp:
-            img = Path(tmp) / "image.png"
-            cv2.imwrite(str(img), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-            req = {"image": str(img), "out": str(Path(tmp) / "mask.npy"), "checkpoint": str(self.checkpoint),
-                   "threshold": self.threshold, "resolution": self.resolution, "dtype": self.dtype,
-                   "threads": self.threads}
-            if prompt is None or isinstance(prompt, str):
-                req["text"] = prompt or "object"
-            elif len(prompt) == 2:
-                req["point"] = [float(v) for v in prompt]
-            elif len(prompt) == 4:
-                req["box"] = [float(v) for v in prompt]
-            else:
-                raise ValueError(f"unsupported prompt {prompt!r}")
-            env = {**os.environ, "PYTHONPATH": str(SAM3_CODE)}
-            r = subprocess.run([str(self.python), str(BRIDGE), json.dumps(req)], capture_output=True, text=True, env=env)
-            if r.returncode != 0:
-                raise RuntimeError(f"SAM 3 bridge failed:\n{r.stderr[-3000:]}")
-            self.last_info = json.loads(r.stdout.strip().splitlines()[-1])
+        self.progress("Loading SAM 3.1 (once, ~30 s)…")
+        cfg = {"checkpoint": str(self.checkpoint), "encoder": self.encoder, "ov_xml": str(OV_ENCODER),
+               "threads": self.threads}
+        log = open(Path(self._tmp) / "bridge.log", "w")
+        self._proc = subprocess.Popen([str(self.python), str(BRIDGE), json.dumps(cfg)], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1,
+                                      env={**os.environ, "PYTHONPATH": str(SAM3_CODE)})
+        atexit.register(self.close)
+        self.last_info = self._read()
+
+    def segment(self, image, prompt=None):
+        image = _check_image(image)
+        req = {"cmd": "prompt", "out": str(Path(self._tmp) / "mask.npy"), "threshold": self.threshold}
+        if isinstance(prompt, dict):
+            req.update({k: (list(map(float, v)) if k != "text" else v) for k, v in prompt.items() if v is not None})
+        elif prompt is None or isinstance(prompt, str):
+            req["text"] = prompt or "object"
+        elif len(prompt) == 2:
+            req["point"] = [float(v) for v in prompt]
+        elif len(prompt) == 4:
+            req["box"] = [float(v) for v in prompt]
+        else:
+            raise ValueError(f"unsupported prompt {prompt!r}")
+        with self._lock:
+            if self._proc is None:
+                self._start()
+            key = hashlib.sha1(image.tobytes()).hexdigest() + str(image.shape)
+            if key != self._image_key:
+                self.progress("Encoding the photo (once per photo)…")
+                img = Path(self._tmp) / "image.png"
+                cv2.imwrite(str(img), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                self._image_key = None
+                self.last_info.update(self._call({"cmd": "image", "path": str(img)}))
+                self._image_key = key
+            self.progress("Segmenting…")
+            self.last_info.update(self._call(req))
             return np.load(req["out"]).astype(bool)
+
+    def close(self):
+        p, self._proc, self._image_key = self._proc, None, None
+        if p is not None and p.poll() is None:
+            try:
+                p.stdin.write('{"cmd": "quit"}\n')
+                p.stdin.flush()
+                p.wait(10)
+            except Exception:
+                p.kill()
 
 
 def get_segmenter(kind="auto", **kw) -> Segmenter:

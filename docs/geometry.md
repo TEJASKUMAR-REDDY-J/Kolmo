@@ -37,32 +37,45 @@ photo. If the solver's `y` points up, use `np.flipud(mask)`.
 Tests: `python -m pytest tests/test_geometry.py` (synthetic drawn shapes: area, scale, placement, rotation, flip,
 periodic wrap, GrabCut IoU > 0.95, determinism; ~5 s).
 
-## SAM 3 (optional, local, no API)
+## SAM 3.1 (local, no API)
+
+Used automatically when installed (`get_segmenter("auto")`); otherwise GrabCut. The app's **Simulate > Obstacle >
+From photo…** opens `photo_dialog.ask`: pick a photo, type what it is and/or click on it, *Segment*, check the
+overlay and grid, *Use as obstacle*. Text and click combine (the instance under the click wins).
 
 SAM 3's requirements would change the base environment (`timm`, `ftfy==6.1.1`, `iopath>=0.1.10`), so it lives in its
-own venv and Kolmo calls it through a subprocess (`sam3_bridge.py`: image path + prompt in, mask `.npy` + JSON
-timings out). Layout (all under the gitignored `third_party/`):
+own venv. `Sam3Segmenter` starts `sam3_bridge.py` there once and keeps it alive (JSON lines over stdin/stdout): the
+model loads once per session and the photo's image embedding is cached, so a re-prompt costs only the prompt.
 
 ```
-third_party/sam3/            facebookresearch/sam3 source (GitHub archive of main)
-third_party/venv-sam3/       python -m venv; torch 2.8.0+cpu, torchvision 0.23.0, numpy 1.26.4, timm, ftfy 6.1.1,
-                             iopath, setuptools<81 (pkg_resources), psutil, openvino 2026.4.1, nncf
-third_party/weights/sam3/    sam3.pt + LICENSE (+ config/tokenizer files) from huggingface.co/facebook/sam3
-third_party/weights/sam3.1/  sam3.1_multiplex.pt + LICENSE from huggingface.co/facebook/sam3.1
+third_party/sam3/              facebookresearch/sam3 source (GitHub archive of main) + 4 small KOLMO PATCHes (below)
+third_party/venv-sam3/         torch 2.8.0+cpu, torchvision 0.23.0, numpy 1.26.4, timm, ftfy 6.1.1, iopath, psutil,
+                               setuptools<81, openvino 2026.4.1, nncf 3.4.0
+third_party/weights/sam3.1/    sam3.1_multiplex.pt (3,502,755,717 bytes) + LICENSE + config.json (facebook/sam3.1)
+third_party/weights/sam3.1/ov/ trunk_int8_1008.xml/.bin: OpenVINO int8 image encoder (sam3_bench.py ov-gpu-int8)
 ```
 
-Setup (once the gated repo access is granted and `hf auth login` is done by the owner):
+Setup (after the owner accepted the gated licence and ran `hf auth login`):
 
 ```
 python -m venv third_party/venv-sam3
 third_party/venv-sam3/Scripts/python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
-third_party/venv-sam3/Scripts/python -m pip install numpy==1.26.4 "timm>=1.0.17" ftfy==6.1.1 regex "iopath>=0.1.10" huggingface_hub tqdm pillow psutil einops pycocotools "setuptools<81"
-python -c "from huggingface_hub import hf_hub_download as d; [d('facebook/sam3', f, local_dir='third_party/weights/sam3') for f in ('LICENSE', 'config.json', 'sam3.pt')]"
+third_party/venv-sam3/Scripts/python -m pip install numpy==1.26.4 "timm>=1.0.17" ftfy==6.1.1 regex "iopath>=0.1.10" huggingface_hub tqdm pillow psutil einops pycocotools "setuptools<81" openvino==2026.4.1 nncf
+python -c "from huggingface_hub import hf_hub_download as d; [d('facebook/sam3.1', f, local_dir='third_party/weights/sam3.1') for f in ('LICENSE', 'config.json', 'sam3.1_multiplex.pt')]"
 ```
 
-Local patch to the SAM 3 source (needed on CPU-only Windows, marked `KOLMO PATCH`):
-`sam3/model/sam3_tracker_utils.py` imports the Triton EDT kernel at module level; it is wrapped in `try/except
-ImportError` (the kernel is only used for video/training point sampling, never by the image model).
+The SAM 3.1 checkpoint's detector loads into SAM 3's image model; the only missing keys are the neck's 4th (0.5x)
+level, which the image model discards (`scalp=1`). Model: 840.5 M parameters (ViT image encoder 454.0 M, text
+encoder 353.7 M, detector/heads ~33 M).
+
+KOLMO PATCHes (CPU-only Windows): `sam3/model/sam3_tracker_utils.py` (Triton import optional),
+`sam3/model/position_encoding.py` and `sam3/model/decoder.py` (no hard-coded `device="cuda"`),
+`sam3/perflib/fused.py` (the fused bf16 MLP is CUDA-only; on CPU plain fp32), `sam3/model/geometry_encoders.py`
+(no `pin_memory` without CUDA).
+
+### Measured (i3-10110U, 2 threads, `truck.jpg` 1800x1200, text prompt, `kolmo/geometry/sam3_bench.py`)
+
+BENCH_TABLE
 
 ## Licences and attribution
 

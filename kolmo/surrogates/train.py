@@ -36,6 +36,7 @@ class TrainConfig:
     val_horizon: int = 20  # surrogate steps in the validation rollout
     patience: int = 5  # evaluations without improvement before stopping
     max_minutes: float = 20.0  # wall-clock cap
+    init_from: str = ""  # start from this checkpoint (path without extension; in an experiment: an earlier model's name)
 
     def validate(self):
         if self.unroll < 1 or self.steps < 1 or self.batch < 1 or self.val_horizon < 1 or self.patience < 1:
@@ -70,6 +71,11 @@ def train(ds, cfg: TrainConfig, verbose=True):
     mean, std = jnp.asarray(ds.mean)[:, None, None], jnp.asarray(ds.std)[:, None, None]
 
     params = net.init(jax.random.PRNGKey(cfg.seed), X[:1, 0], Cn[:1])
+    if cfg.init_from:  # fine-tuning: same architecture and dataset (hence normalisation) required
+        prev, meta = load(cfg.init_from)
+        if meta["arch"] != cfg.model or meta["data_hash"] != ds.hash:
+            raise ValueError(f"init_from {cfg.init_from}: architecture or dataset differs")
+        params = prev.params
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(optax.cosine_decay_schedule(cfg.lr, cfg.steps)))
     opt_state = opt.init(params)
 

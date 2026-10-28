@@ -15,6 +15,7 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from kolmo import evaluate as ev
 from kolmo.evaluate import rel_l2, write_json
 from kolmo.hybrid import HybridPolicy, cost, run
 from kolmo.surrogates import data, latent, train
@@ -22,11 +23,39 @@ from kolmo.surrogates import data, latent, train
 BASE = "runs/kolmogorov64_long_horizon-88294366/checkpoints"
 MODELS = {"jepa_latent": lambda: latent.load("runs/latent_kolmogorov64/jepa/latent")[0],
           "cnn_rollout4": lambda: train.load(f"{BASE}/cnn_rollout4")[0],
-          "cnn_one_step": lambda: train.load(f"{BASE}/cnn_one_step")[0]}
+          "cnn_one_step": lambda: train.load(f"{BASE}/cnn_one_step")[0],
+          "jepa_k8": lambda: latent.load("runs/latent_kolmogorov64/jepa_k8/latent")[0],
+          "jepa_k8_noise": lambda: latent.load("runs/latent_kolmogorov64/jepa_k8_noise/latent")[0]}
 POLICIES = [HybridPolicy("surrogate")] + [HybridPolicy(every=k) for k in (20, 10, 5, 2)] + [HybridPolicy(energy_tol=0.2), HybridPolicy(residual_tol=0.5)]  # reference 10-step residual ~0.06, surrogates 0.45-0.55
+# study -> (models, policies, write pareto plot). "horizon": stability extension (K=8 curriculum, latent noise) + stats.
+STUDIES = {"full": (["jepa_latent", "cnn_rollout4", "cnn_one_step"], POLICIES, True),
+           "horizon": (["jepa_latent", "jepa_k8", "jepa_k8_noise", "cnn_rollout4"],
+                       [HybridPolicy("surrogate"), HybridPolicy(every=20), HybridPolicy(every=10)], False)}
 
 
-def main(out="runs/latent_hybrid_study"):
+DSTRIDE = 5  # ponytail: diagnostics cost ~30 ms per state here; every 5th step for the time means
+
+
+def stats(system, trs, refs, params, ref_diag):
+    """Statistical fidelity, median over trajectories: time-mean spectrum error (dex, evaluate.spectrum_error) and
+    time-mean energy / enstrophy relative error (evaluate.rollout_stats), steps 1, 6, .., T."""
+    kmax = refs.shape[-1] // 3
+    spec, en, ens = [], [], []
+    for tr, ref, p, rd in zip(trs, refs, params, ref_diag):
+        s = np.asarray(tr)
+        fin = np.isfinite(s).all((1, 2, 3))
+        spec.append(float(ev.spectrum_error(ev.spectrum(np.where(fin[:, None, None, None], s, np.inf))[1:].mean(0),
+                                            ev.spectrum(ref)[1:].mean(0), kmax)))
+        st = ev.rollout_stats([system.diagnostics(x, p) if f else None for x, f in zip(s[1::DSTRIDE], fin[1::DSTRIDE])],
+                              rd)
+        en.append(st["energy"]["mean_rel_err"])
+        ens.append(st["enstrophy"]["mean_rel_err"])
+    return {"spectrum_err_dex": float(np.median(spec)), "energy_mean_rel_err": float(np.median(en)),
+            "enstrophy_mean_rel_err": float(np.median(ens))}
+
+
+def main(out="runs/latent_hybrid_study", study="full"):
+    names, policies, do_plot = STUDIES[study]
     with open("benchmarks/long_horizon.json") as f:
         cfg = json.load(f)
     ds = data.build(data.DataConfig(**cfg["data"]), "runs/cache")
@@ -34,10 +63,17 @@ def main(out="runs/latent_hybrid_study"):
     sp = ds.splits["test"]
     T = cfg["eval_steps"]
     sim_time = T * ds.config.spacing * sp.params[0]["dt"]
-    surs = {m: f() for m, f in MODELS.items()}
-    rows = []
+    surs = {m: MODELS[m]() for m in names}
+    rows, ref_diag = [], None
+    if study != "full":
+        ref_diag = [[system.diagnostics(x, p) for x in r[1:T + 1:DSTRIDE]] for r, p in zip(sp.states, sp.params)]
+        # sampling floor: each test trajectory scored against the other seed of its pair (same nu), as if it were a
+        # prediction; test order is nu-major, seed-minor, so i ^ 1 is the same nu
+        j = [i ^ 1 for i in range(len(sp.seeds))]
+        floor = stats(system, [sp.states[k, :T + 1] for k in j], sp.states[:, :T + 1], sp.params, ref_diag)
+        print("floor (other seed)", floor, flush=True)
     for m, sur in surs.items():
-        for pol in POLICIES:
+        for pol in policies:
             trs = [run(pol, system, sp.params[i], sur, sp.states[i, 0], T) for i in range(len(sp.seeds))]
             med = np.median([rel_l2(tr.states, sp.states[i, :T + 1]) for i, tr in enumerate(trs)], axis=0)
             nonphys = sum(int((np.abs(np.nan_to_num(tr.states, nan=np.inf)).max((1, 2, 3)) >
@@ -45,22 +81,26 @@ def main(out="runs/latent_hybrid_study"):
             rows.append({"model": m, "policy": pol.name, "max_rel_l2": float(np.max(med)),
                          "mean_rel_l2": float(np.mean(med[1:])), "cost_fraction": float(np.mean([cost(tr, ds.config.spacing)
                          ["fraction_of_reference"] for tr in trs])), "nonphysical_steps": nonphys, "seconds": []})
+            if study != "full":
+                rows[-1].update(stats(system, [tr.states for tr in trs], sp.states[:, :T + 1], sp.params, ref_diag))
             print(m, pol.name, {k: round(v, 3) for k, v in rows[-1].items() if isinstance(v, float)}, flush=True)
     ref_s = []
     for rep in range(3):  # ponytail: interleaved repeats share machine load; median of 3 is the noise control
-        ref_s.append(run(HybridPolicy("reference"), system, sp.params[0], surs["cnn_one_step"], sp.states[0, 0], T).seconds)
+        ref_s.append(run(HybridPolicy("reference"), system, sp.params[0], surs[names[0]], sp.states[0, 0], T).seconds)
         for r in rows:
-            pol = next(p for p in POLICIES if p.name == r["policy"])
+            pol = next(p for p in policies if p.name == r["policy"])
             r["seconds"].append(run(pol, system, sp.params[0], surs[r["model"]], sp.states[0, 0], T).seconds)
     ref = float(np.median(ref_s))
     for r in rows:
         r["wall_s_per_time_unit"] = float(np.median(r["seconds"])) / sim_time
         r["speedup_vs_reference"] = ref / float(np.median(r["seconds"]))
-    res = {"reference_wall_s_per_time_unit": ref / sim_time, "reference_seconds": ref_s, "sim_time_units": sim_time,
+    res = {"floor_other_seed": floor if study != "full" else None, "reference_wall_s_per_time_unit": ref / sim_time, "reference_seconds": ref_s, "sim_time_units": sim_time,
            "n_traj": len(sp.seeds), "steps": T, "rows": rows}
     os.makedirs(out, exist_ok=True)
     write_json(res, f"{out}/results.json")
 
+    if not do_plot:
+        return
     fig, ax = plt.subplots(figsize=(6.4, 4.4))
     for (m, c), mk in zip({"jepa_latent": "C0", "cnn_rollout4": "C1", "cnn_one_step": "C2"}.items(), "os^"):
         rs = sorted((r for r in rows if r["model"] == m), key=lambda r: r["cost_fraction"])

@@ -11,6 +11,8 @@ Objective per window x_0..x_K (normalised units, train-set stats as models.py), 
     + w_rec * mean_k ||G(E(x_k)) - x_k||^2                                 small autoencoding term (states comparable)
     + mean_k ||G(sg(h_k)) - x_k||^2                                        trains G only, on predicted latents
 Ablation (w_jepa=0, pixel_grad=True): same network trained by decoded-rollout pixel loss, i.e. a latent but not JEPA model.
+Stability options: unroll_start (curriculum K_start -> unroll at half of training), latent_noise (input noise sigma
+on each predictor step during training, sigma relative to latent std ~1 kept by VICReg).
 E_ema is an exponential moving average of E (rate `ema`), never differentiated; std/Cov are over batch x latent grid,
 per latent channel d. rec_grad=False stops the reconstruction gradient at the encoder (pure JEPA, G is a probe).
 Rollout (`LatentSurrogate.stepper`): the latent state is carried between calls and decoded for output; it is
@@ -82,6 +84,8 @@ class LatentConfig(TrainConfig):
     rec_grad: bool = True  # False: reconstruction does not shape the encoder (pure JEPA + probe decoder)
     w_jepa: float = 1.0  # latent prediction weight (ablation: 0 together with pixel_grad=True)
     pixel_grad: bool = False  # ablation: decoded-rollout pixel loss trains P and E too (no stop-gradient)
+    unroll_start: int = 0  # curriculum: latent unroll for the first half of training (0 = always `unroll`)
+    latent_noise: float = 0.0  # std of Gaussian noise added to each predicted latent before the next step
 
 
 @dataclass
@@ -141,7 +145,7 @@ def train(ds, cfg: LatentConfig, verbose=True):
     sg = jax.lax.stop_gradient
 
     # ponytail: Python loop over K, not lax.scan (train.py: XLA CPU convs in loops ~90x slower)
-    def loss_fn(p, tp, win, c):  # win (B, K+1, C, H, W)
+    def loss_fn(p, tp, win, c, key):  # win (B, K+1, C, H, W)
         B, K1 = win.shape[:2]
         flat = win.reshape((B * K1,) + win.shape[2:])
         e = A(p, LatentWM.encode, flat)
@@ -149,6 +153,8 @@ def train(ds, cfg: LatentConfig, verbose=True):
         rec = jnp.mean((A(p, LatentWM.decode, e if cfg.rec_grad else sg(e)) - flat) ** 2)
         h, pred, prec = e.reshape((B, K1) + e.shape[1:])[:, 0], [], []
         for k in range(1, K1):
+            if cfg.latent_noise:  # perturb every predictor input; losses compare the clean output
+                h = h + cfg.latent_noise * jax.random.normal(jax.random.fold_in(key, k), h.shape)
             h = A(p, LatentWM.predict, h, c)
             pred.append(jnp.mean((h - tgt[:, k]) ** 2))
             prec.append(jnp.mean((A(p, LatentWM.decode, h if cfg.pixel_grad else sg(h)) - win[:, k]) ** 2))
@@ -158,8 +164,8 @@ def train(ds, cfg: LatentConfig, verbose=True):
         return total, jnp.stack([jepa, v, cv, rec, s])
 
     @jax.jit
-    def update(p, tp, o, win, c):
-        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(p, tp, win, c)
+    def update(p, tp, o, win, c, key):
+        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(p, tp, win, c, key)
         u, o = opt.update(g, o, p)
         p = optax.apply_updates(p, u)
         tp = jax.tree_util.tree_map(lambda t, q: cfg.ema * t + (1 - cfg.ema) * q, tp, p)
@@ -182,9 +188,11 @@ def train(ds, cfg: LatentConfig, verbose=True):
     t0 = time.perf_counter()
     for it in range(1, cfg.steps + 1):
         i = rng.integers(0, N, cfg.batch)
+        K = cfg.unroll_start if cfg.unroll_start and it <= cfg.steps // 2 else cfg.unroll
         t = rng.integers(0, T1 - K, cfg.batch)
         win = X[i[:, None], t[:, None] + np.arange(K + 1)[None]]
-        params, target, opt_state, loss, parts = update(params, target, opt_state, win, Cn[i])
+        params, target, opt_state, loss, parts = update(params, target, opt_state, win, Cn[i],
+                                                             jax.random.PRNGKey(cfg.seed * 100003 + it))
         losses.append(loss)
         parts_acc.append(parts)
         if it % cfg.eval_every == 0 or it == cfg.steps:
@@ -218,7 +226,7 @@ def load(path, mode="latent") -> tuple[LatentSurrogate, dict]:
     return LatentSurrogate(**vars(sur), mode=mode), meta
 
 
-def main(config_path, out_dir, **overrides):
+def main(config_path, out_dir, evaluate=True, **overrides):
     """Train one latent model on the benchmark's dataset and evaluate it (latent and re-encode rollouts)."""
     from kolmo import evaluate as ev
     from kolmo.surrogates import data
@@ -236,6 +244,8 @@ def main(config_path, out_dir, **overrides):
     sur, hist = train(ds, lc)
     save(ck, sur, ds, lc, hist, train_minutes=(time.perf_counter() - t) / 60)
     print(f"params: {n_params(sur.params)}", flush=True)
+    if not evaluate:
+        return
     system = data.get_system(dcfg.system)
     res = {}
     for mode in ("latent", "reencode"):
