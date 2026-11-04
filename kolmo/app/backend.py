@@ -74,9 +74,13 @@ def experiments():
         except (OSError, ValueError):
             continue
         rep = res.parent / "report.md"
-        out.append({"name": res.parent.name, "dir": str(res.parent), "rows": ev.table(results) if ev else [],
+        try:
+            rows = ev.table(results) if ev else []
+        except (KeyError, TypeError, AttributeError):  # results of another layout (e.g. latent studies): no table
+            rows = []
+        out.append({"name": res.parent.name, "dir": str(res.parent), "rows": rows,
                     "n_findings": n, "report": str(rep) if rep.exists() else None,
-                    "runtime": {m: r.get("runtime", {}) for m, r in results.items()}})
+                    "runtime": {m: r.get("runtime", {}) for m, r in results.items() if isinstance(r, dict)}})
     return out
 
 
@@ -132,14 +136,53 @@ DESCRIPTIONS = {
 }
 
 
+LABELS = {"fluid2d": "Fluid 2D", "diffusion": "Diffusion", "boussinesq": "Boussinesq"}
+_SYSTEMS_CACHE = None
+
+
 def systems():
-    """[(label, instance or None, reason if None)] in display order."""
+    """[(label, instance or None, reason if None)] in display order. Uses the registry kolmo.systems.SYSTEMS / make()
+    (docs/contracts.md) when present, plus the PDE library; falls back to the two built-in systems. Cached."""
+    global _SYSTEMS_CACHE
+    if _SYSTEMS_CACHE is not None:
+        return _SYSTEMS_CACHE
     out = []
-    m, why = _import("kolmo.systems.fluid2d")
-    out.append(("Fluid 2D", m.Fluid2D() if m else None, why))
-    from kolmo.systems.diffusion import Diffusion
-    out.append(("Diffusion", Diffusion(), None))
+    reg, _ = _import("kolmo.systems")
+    names = list(getattr(reg, "SYSTEMS", {}) or {})
+    if names and hasattr(reg, "make"):
+        for name in names:
+            if name == "pde":
+                continue  # spec-driven: listed through its library below
+            try:
+                out.append((LABELS.get(name, name.replace("_", " ").title()), reg.make(name), None))
+            except Exception as e:  # noqa: BLE001 - listed disabled with the reason
+                out.append((LABELS.get(name, name), None, f"{type(e).__name__}: {e}"))
+        pde, why = _import("kolmo.systems.pde")
+        lib = getattr(pde, "LIBRARY", None) if pde else None  # ponytail: contract names no attribute; adapt here
+        for key, spec in (lib or {}).items():
+            try:
+                out.append((f"PDE · {key.replace('_', ' ')}", reg.make(spec), None))
+            except Exception as e:  # noqa: BLE001
+                out.append((f"PDE · {key}", None, f"{type(e).__name__}: {e}"))
+    else:
+        m, why = _import("kolmo.systems.fluid2d")
+        out.append(("Fluid 2D", m.Fluid2D() if m else None, why))
+        from kolmo.systems.diffusion import Diffusion
+        out.append(("Diffusion", Diffusion(), None))
+    _SYSTEMS_CACHE = out
     return out
+
+
+def _described(system):
+    try:
+        return system.describe() if hasattr(system, "describe") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _decimals(*vals):
+    v = min((abs(float(x)) for x in vals if isinstance(x, (int, float)) and x), default=1.0)
+    return max(2, min(6, 2 - int(math.floor(math.log10(v)))))
 
 
 def system_by_name(name):
@@ -150,7 +193,24 @@ def system_by_name(name):
 
 
 def param_specs(system):
-    """Known specs, else one generic spec per numeric default (a new system works before it is described here)."""
+    """Specs from system.describe()["params"] ({default, min, max, unit, help}) when the system describes itself, else
+    the hand-written table, else one generic spec per numeric default."""
+    d = _described(system)
+    if d and d.get("params"):
+        out = []
+        for k, q in d["params"].items():
+            dv, lo, hi = q.get("default"), q.get("min"), q.get("max")
+            num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+            if k == "mask" or not (dv is None or num(dv)) or not all(x is None or num(x) for x in (lo, hi)):
+                continue  # arrays, tuples, strings: not an auto-form field (the system default applies)
+            if dv is None and lo is None:
+                continue
+            is_int = all(isinstance(x, int) and not isinstance(x, bool) for x in (dv, lo, hi) if x is not None)
+            lo = lo if lo is not None else 0
+            hi = hi if hi is not None else 1e6  # open-ended: validate() has the last word
+            out.append(Param(k, k, "" if q.get("unit") in (None, "", "1") else q["unit"], lo, hi, 0 if is_int else _decimals(dv, lo, hi),
+                             tip=q.get("help", ""), auto=dv is None))
+        return out
     if system.name in PARAMS:
         return PARAMS[system.name]
     out = []
@@ -167,12 +227,23 @@ def defaults(system):
     raw = {**getattr(system, "DEFAULTS", {}), **UI_DEFAULTS.get(system.name, {})}
     d = system.validate(raw)
     for sp in param_specs(system):
-        if sp.auto and raw.get(sp.key) is None:
+        if sp.auto and raw.get(sp.key) is None and sp.key not in exclusive(system):
             d[sp.key] = None
     return d
 
 
+EXCLUSIVE = {"fluid2d": ("Re", "nu")}  # give one of the pair, never both (validate() rejects a mismatch)
+
+
+def exclusive(system):
+    return EXCLUSIVE.get(system.name, ())
+
+
 def describe(system):
+    d = _described(system)
+    if d and d.get("equations"):
+        checks = "; ".join(d.get("checks") or [])
+        return d["equations"] + (f"\nGuarantees: {checks}" if checks else "")
     return DESCRIPTIONS.get(system.name, (system.__doc__ or "").strip().split("\n")[0])
 
 
@@ -270,6 +341,12 @@ def training_params(stem):
 def load_surrogate(stem):
     if not stem:
         raise Unavailable(TRAIN_HELP)
+    try:
+        kind = checkpoint_meta(stem).get("arch", {}).get("kind")
+    except (OSError, ValueError):
+        kind = None
+    if kind == "latent":  # JEPA-style latent model: its own wrapper around the same checkpoint format
+        return _need("kolmo.surrogates.latent").load(str(stem))
     train = _need("kolmo.surrogates.train")
     try:
         return train.load(str(stem))
@@ -432,7 +509,7 @@ def summarize(run, stopped=False):
     T = len(run.ref_states) - 1
     if run.keep and T >= 1:
         ref = np.stack(run.ref_states)
-        bad = ro.detect_failures(ref)
+        bad = [e for e in ro.detect_failures(ref) if e["reason"] == "nonfinite"]  # growth from rest is not a failure
         facts += [f"Reference solver: {e['reason']} at step {e['step']} ({e['detail']})" for e in bad]
         if "cfl" in (run.system.diagnostics(ref[-1], run.params) or {}):
             cfl = max(run.system.diagnostics(ref[t], run.params)["cfl"] for t in range(0, T + 1, max(1, T // 50)))
@@ -514,3 +591,103 @@ def load_config(path):
     if "system" not in cfg:
         raise ValueError("not a Kolmo config: no 'system' key")
     return cfg
+
+
+# ---------------------------------------------------------------- model registry
+
+def models(system=None):
+    """Registered models (kolmo.surrogates.registry, docs/contracts.md) plus checkpoints on disk that are not registered
+    yet ("registered": False; metrics read from their experiment's results.json), newest first. "path" = checkpoint stem."""
+    reg, _ = _import("kolmo.surrogates.registry")
+    out = [dict(e, registered=True) for e in (reg.list(system) if reg is not None else [])]
+    known = {str(Path(e["path"])) for e in out}
+    for lbl, s, _ in systems():
+        if s is None or (system and s.name != system):
+            continue
+        for label, stem in checkpoints(s):
+            if str(Path(stem)) in known:
+                continue
+            meta, run_dir = checkpoint_meta(stem), Path(stem).parent.parent
+            rep, metrics = run_dir / "report.md", {}
+            try:
+                r = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))[Path(stem).name]
+                t = r["splits"]["test"]
+                metrics = {"one_step": t["horizons"].get("1"), "error_at_10": t["horizons"].get("10"),
+                           "steps_to_failure": t["time_to_failure"]["median_observed"],
+                           "speedup": r.get("runtime", {}).get("speedup")}
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            out.append({"id": label, "name": Path(stem).name, "system": s.name, "registered": False,
+                        "kind": meta.get("arch", {}).get("kind", "?"), "path": stem,
+                        "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(Path(stem + ".json").stat().st_mtime)),
+                        "metrics": metrics, "report": str(rep) if rep.exists() else None})
+    return sorted(out, key=lambda e: str(e.get("created", "")), reverse=True)
+
+
+def register_model(stem):
+    """Add a checkpoint of an experiment run to the registry."""
+    stem = Path(stem)
+    return _need("kolmo.surrogates.registry").register(str(stem.parent.parent), stem.name)
+
+
+# ---------------------------------------------------------------- research agent
+
+def agent_run(agent, question, confirmed, emit, should_stop=None):
+    """Run the research agent, forwarding its events (docs/contracts.md: plan / status / tool / progress / result /
+    zen / error / done) to emit(dict). Uses agent.run(question, on_event=...) when it exists; with the older
+    agent.ask(...) API it forwards log lines as status and the trace as tool events, then emits
+    {"type": "answer", **ask_result}. Returns nothing; call from a worker thread."""
+    run = getattr(agent, "run", None)
+    if callable(run):
+        kw = {"on_event": emit}
+        if should_stop is not None and "should_stop" in inspect.signature(run).parameters:
+            kw["should_stop"] = should_stop
+        if "confirmed" in inspect.signature(run).parameters:
+            kw["confirmed"] = confirmed
+        r = run(question, **kw)
+        if isinstance(r, dict) and "status" in r:
+            emit({"type": "answer", **r})
+        return
+    r = agent.ask(question, confirmed, log=lambda *a: emit({"type": "status", "text": " ".join(map(str, a))}))
+    for t in r.get("trace") or []:
+        res = t.get("result") or {}
+        ok = not (isinstance(res, dict) and (res.get("error") or res.get("ok") is False))
+        emit({"type": "tool", "name": t.get("tool"), "args": t.get("arguments"), "ok": ok,
+              "summary": str(res.get("error") or res.get("summary") or "")[:200] if isinstance(res, dict) else ""})
+    emit({"type": "answer", **r})
+    emit({"type": "done"})
+
+
+def can_cancel_agent(agent):
+    run = getattr(agent, "run", None)
+    return callable(run) and "should_stop" in inspect.signature(run).parameters
+
+
+# ---------------------------------------------------------------- training from the UI
+
+TRAIN_KINDS = ("cnn", "fno", "nca_hybrid")  # trained with kolmo.surrogates.train.fit (progress + cancel)
+TRAIN_HELP_LATENT = "latent models train with python -m kolmo.surrogates.latent (no progress API yet)"
+
+
+def train_model(system, params, kind, budget, on_progress=None, should_stop=None, out_dir=None):
+    """Generate reference data for `system` at `params`, fit a `kind` surrogate for `budget` optimiser steps with
+    progress and cancel, save it under runs/ui-train-<system>-<kind>-<time>/checkpoints/<kind> and register it.
+    Returns the registry entry (or {"path": ...} when the registry is unavailable). Call from a worker thread."""
+    data, train = _need("kolmo.surrogates.data"), _need("kolmo.surrogates.train")
+    if kind not in TRAIN_KINDS:
+        raise Unavailable(TRAIN_HELP_LATENT if kind == "latent" else f"unknown model kind {kind!r}")
+    p = {k: v for k, v in (params or {}).items() if v is not None and k != "mask"}
+    dcfg = data.DataConfig(system=system.name, params=p).validate()
+    if on_progress:
+        on_progress({"phase": "data", "step": 0, "total": int(budget), "loss": None, "val_rollout_error": None, "eta_s": None})
+    ds = data.build(dcfg, str(ROOT / "runs" / "cache"), verbose=False)
+    tcfg = train.TrainConfig(model={"kind": kind}, steps=int(budget), eval_every=max(10, int(budget) // 10))
+    t0 = time.perf_counter()
+    sur, hist = train.fit(ds, tcfg, verbose=False, on_progress=on_progress, should_stop=should_stop)
+    run_dir = Path(out_dir or ROOT / "runs") / f"ui-train-{system.name}-{kind}-{time.strftime('%Y%m%d-%H%M%S')}"
+    stem = run_dir / "checkpoints" / kind
+    train.save(str(stem), sur, ds, tcfg, hist, train_minutes=(time.perf_counter() - t0) / 60)
+    reg, _ = _import("kolmo.surrogates.registry")
+    entry = reg.register(str(run_dir), kind) if reg is not None else {"path": str(stem)}
+    entry["history"] = hist
+    return entry

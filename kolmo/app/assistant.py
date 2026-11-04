@@ -55,6 +55,24 @@ def plan(summary):
     return list(dict.fromkeys(f["next"] for f in summary.get("findings", []) if f.get("next")))
 
 
+def training_summary(vals, losses=()):
+    """One honest line about a training run from its validation rollout errors and losses (measured values only)."""
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return f"training · loss {losses[-1]:.3g}" if losses else "waiting for the first progress report"
+    best = min(range(len(vals)), key=vals.__getitem__)
+    since = len(vals) - 1 - best
+    if len(vals) >= 2 and vals[-1] > 1.5 * vals[best]:
+        return f"val error rising: {vals[-1]:.3g} vs best {vals[best]:.3g} (instability or overfitting)"
+    if since >= 3:
+        return f"val error plateaued {since} evals (best {vals[best]:.3g})"
+    if len(vals) >= 2:
+        k = min(3, len(vals) - 1)
+        drop = 100 * (1 - vals[-1] / vals[-1 - k]) if vals[-1 - k] else 0
+        return f"val error {vals[-1]:.3g}, {'down' if drop >= 0 else 'up'} {abs(drop):.0f}% over the last {k} evals"
+    return f"val error {vals[-1]:.3g} after the first eval"
+
+
 if __name__ == "__main__":
     a = RuleBased()
     assert a.reply("run it", {})[1] == "run"
@@ -64,4 +82,6 @@ if __name__ == "__main__":
     assert b.reply("yes", {"pending": "q"})[1] == "confirm" and b.reply("no", {"pending": "q"})[1] is None
     s = {"facts": ["x"], "findings": [{"level": "info", "fact": "f", "next": "n1"}, {"level": "w", "fact": "g", "next": "n1"}]}
     assert plan(s) == ["n1"] and "f" in a.reply("explain", {"summary": s})[0]
+    assert "plateaued 3" in training_summary([1, 0.5, 0.6, 0.55, 0.52])
+    assert "rising" in training_summary([0.2, 0.5]) and "down" in training_summary([1, 0.5])
     print("ok")

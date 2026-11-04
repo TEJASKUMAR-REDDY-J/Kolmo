@@ -31,6 +31,8 @@ def wait(app, cond, timeout=300.0):
 
 
 def shot(win, name):
+    for _ in range(3):  # queued show events of newly added widgets
+        QApplication.processEvents()
     win.grab().save(str(OUT / name))
     print("saved", OUT / name)
 
@@ -116,9 +118,6 @@ def main():
         print(f"hybrid every 10: rel L2 max {max(win.err):.3g}, interventions {len(win.err_chart.vlines)}")
         print("diagnosis:", win.findings.toPlainText()[:400].replace("\n", " | "))
         shot(win, "04_hybrid.png")
-        win.side_tabs.button(1).click()
-        shot(win, "04_hybrid_assistant.png")
-        win.side_tabs.button(0).click()
         win.nav.button(1).click()
         shot(win, "07_experiments.png")
         win.nav.button(0).click()
@@ -153,6 +152,78 @@ def main():
         print(f"fluid2d cylinder: cd at step 400 = {win.diag_ref['cd'][-1]:.3g}, header: {win.run_sub.text()}")
         win.diag_key.setCurrentText("cd")
         shot(win, "06_fluid_cylinder.png")
+    # PDE library system with two fields (auto-form from describe(), field selector)
+    gs = next((i for i, (lbl, s_, _) in enumerate(win._systems) if s_ is not None and "gray" in lbl.lower()), None)
+    if gs is not None:
+        win.system.setCurrentIndex(gs)
+        win.mode_group.button(0).click()
+        win.steps.setValue(200)
+        win.run()
+        wait(app, lambda: win.runner is None)
+        assert win.pill.text() == "Finished", (win.pill.text(), win.run_error.text())
+        assert win.field_sel.count() == 2 and win.field_sel.isVisible()
+        win.field_sel.setCurrentIndex(1)
+        print(f"gray-scott: {len(win.xs) - 1} steps, params {[sp.key for sp in win.specs]}")
+        shot(win, "11_pde_gray_scott.png")
+
+    # Fluid 2D viscosity: Re or nu, never both
+    select_system(win, "fluid2d")
+    assert win.excl_sel.isVisible() and win.excl_sel.count() == 2
+    win.excl_sel.setCurrentIndex([win.excl_sel.itemData(i) for i in range(2)].index("Re"))
+    p = win._params()
+    assert p["nu"] is None and p["Re"] is not None and not win.param_widgets["nu"].isVisible()
+
+    # Train new (REAL tiny run): diffusion CNN, 60 optimiser steps, progress into the Training panel, registered
+    win.nav.button(3).click()
+    win.trn_sys.setCurrentIndex(win.trn_sys.findData("diffusion"))
+    win.trn_kind.setCurrentIndex(win.trn_kind.findData("cnn"))
+    win.trn_budget.setValue(60)
+    win._train()
+    wait(app, lambda: win.trn_btn.isEnabled(), 900)
+    print("train:", win.trn_note.text(), "| summary:", win.train_summary.text(), "| loss points:", len(win.tr["loss"]))
+    assert win.tr["loss"] and "registered" in win.trn_note.text(), win.trn_note.text()
+    win.nav.button(0).click()
+    win.pages.widget(0).verticalScrollBar().setValue(10 ** 6)
+    shot(win, "12_training_real.png")
+    win.pages.widget(0).verticalScrollBar().setValue(0)
+
+    # Models page: registry + disk checkpoints
+    win.nav.button(3).click()
+    app.processEvents()
+    print(f"models page: {win.mdl_list.count()} models listed")
+    shot(win, "08_models.png")
+    win.nav.button(0).click()
+
+    # zen mode: user toggle, agent zen:on honoured, ignored after the user turned it off during the task
+    win.set_zen(True)
+    wait(app, lambda: not win.nav_card.isVisible() and win.side_card.width() == 520, 5)
+    assert win.zen and not win.setup_card.isVisible()
+    shot(win, "09_zen.png")
+    win._agent_busy = True  # an agent task is running
+    win.set_zen(False)  # the user leaves zen during the task
+    win.set_zen(True, source="agent")
+    assert not win.zen, "agent zen:on must be ignored after the user turned zen off during the task"
+    win.set_zen(True)  # the user re-enables: agent events count again
+    win.set_zen(False, source="agent")
+    assert not win.zen
+    win.set_zen(True, source="agent")
+    assert win.zen
+    win._agent_busy = False
+    win.set_zen(False)
+    wait(app, lambda: win.nav_card.isVisible() and win.nav_card.width() == 214, 5)
+
+    # agent activity + training panel driven by contract events (TEST INPUT: synthetic events, not measurements)
+    win.act_box.setVisible(True)
+    win._reset_training()
+    win._agent_event({"type": "plan", "steps": ["Validate config", "Train surrogate", "Evaluate rollout"]}, "q")
+    win._agent_event({"type": "tool", "name": "validate_config", "ok": True, "summary": "ok"}, "q")
+    for k, (loss, val) in enumerate([(1.0, 0.9), (0.5, 0.6), (0.3, 0.5), (0.25, 0.51), (0.22, 0.505), (0.2, 0.502)], 1):
+        win._agent_event({"type": "progress", "phase": "train", "step": 100 * k, "total": 1000, "loss": loss,
+                          "val_rollout_error": val, "eta_s": 30.0 * (10 - k)}, "q")
+    assert "plateaued 3" in win.train_summary.text(), win.train_summary.text()
+    assert win._step_states == ["done", "running", "pending"], win._step_states
+    win.pages.widget(0).verticalScrollBar().setValue(10 ** 6)  # scroll the centre to the training card
+    shot(win, "10_agent_training_SYNTHETIC_TEST_EVENTS.png")
     win.close()
     print("gui smoke ok")
 

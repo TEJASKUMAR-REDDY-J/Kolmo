@@ -99,7 +99,7 @@ class Backdrop(QWidget):
     def __init__(self):
         super().__init__()
         Backdrop.instance = self
-        self.t, self.frame, self.blur_version = 0.0, 0, 0
+        self.t, self.frame, self.blur_version, self.dim = 0.0, 0, 0, 0.0
         self.enabled, self.hold = True, False
         self.x = np.linspace(0, 1, self.W, dtype=np.float32)
         self.y = np.linspace(0, 1, self.H, dtype=np.float32)[:, None]
@@ -137,10 +137,17 @@ class Backdrop(QWidget):
             lum = (0.35 + 0.25 * np.sin(2.3 * x - 3 * t + ph)) * 0.55
             d = (y - yc) / wd
             img += (np.exp(-d * d) * lum)[..., None] * (np.array(col, np.float32) * self.vign)
+        img *= 1 - 0.6 * self.dim  # zen mode darkens the fabric
         a = np.ascontiguousarray(np.clip(img, 0, 255).astype(np.uint8))
         self.image = QImage(a.data, self.W, self.H, a.strides[0], QImage.Format_RGB888).copy()
         b = np.ascontiguousarray(a.reshape(self.H // 4, 4, self.W // 4, 4, 3).mean((1, 3)).astype(np.uint8))
         self.blurred = QImage(b.data, b.shape[1], b.shape[0], b.strides[0], QImage.Format_RGB888).copy()
+
+    def set_dim(self, v):
+        self.dim = float(v)
+        self._render()
+        self.blur_version += 1  # cards re-sample the darker backdrop
+        self.update()
 
     def paintEvent(self, e):
         p = QPainter(self)

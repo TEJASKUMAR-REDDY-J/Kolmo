@@ -11,16 +11,18 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QParallelAnimationGroup, QPointF, QPropertyAnimation,
+                            QRectF, QSettings, Qt, QThread, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QConicalGradient, QImage, QKeySequence, QPainter, QPen,
                            QPixmap, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (QAbstractSpinBox, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QPushButton,
+                               QDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+                               QProgressBar, QPushButton,
                                QScrollArea, QSizePolicy, QSlider, QSpinBox, QStackedWidget, QTextBrowser, QVBoxLayout,
                                QWidget)
 
 from kolmo.app import backend
-from kolmo.app.assistant import RuleBased, plan
+from kolmo.app.assistant import RuleBased, plan, training_summary
 from kolmo.assistant.agent import Agent
 from kolmo.app.widgets import (ACCENT, ACCENT2, CAND, COMPARE, DIVERGING, EVENT, FAIL, FAINT, MUTED, OK, REF,
                                SEQUENTIAL, SYMBOL_FONT, TEXT, Backdrop, ColorBar, FieldView, Glass, LineChart,
@@ -84,6 +86,12 @@ QPushButton#chip:checked {{ background: rgba(124,92,255,0.35); border-color: rgb
 QPushButton#link {{ background: transparent; border: none; color: {ACCENT2}; padding: 0; text-align: left; }}
 QPushButton#link:hover {{ color: {TEXT}; }}
 QTextBrowser {{ background: transparent; border: none; }}
+QListWidget {{ background: transparent; border: none; outline: none; }}
+QListWidget::item {{ padding: 9px 10px; border-radius: 10px; margin: 2px 0; }}
+QListWidget::item:hover {{ background: rgba(255,255,255,0.06); }}
+QListWidget::item:selected {{ background: rgba(124,92,255,0.35); color: white; }}
+QProgressBar {{ background: rgba(255,255,255,0.10); border: none; border-radius: 3px; }}
+QProgressBar::chunk {{ border-radius: 3px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c5cff, stop:1 #d29bff); }}
 QCheckBox {{ color: {MUTED}; spacing: 6px; }}
 QSlider::groove:horizontal {{ height: 5px; border-radius: 2px; background: rgba(255,255,255,0.12); }}
 QSlider::sub-page:horizontal {{ border-radius: 2px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c5cff,
@@ -229,6 +237,39 @@ class Runner(QThread):
             self.failed.emit(traceback.format_exc(limit=4))
 
 
+class TrainTask(QThread):
+    """fn(progress_callback) off the UI thread; progress dicts arrive on the UI thread."""
+    progress, ok, err = Signal(object), Signal(object), Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.ok.emit(self.fn(self.progress.emit))
+        except (ValueError, RuntimeError) as e:
+            self.err.emit(str(e))
+        except Exception:  # noqa: BLE001
+            self.err.emit(traceback.format_exc(limit=3))
+
+
+class AgentTask(QThread):
+    """Runs the research agent off the UI thread; every agent event arrives as a signal on the UI thread."""
+    event = Signal(object)
+
+    def __init__(self, agent, question, confirmed, should_stop):
+        super().__init__()
+        self.agent, self.question, self.confirmed, self.should_stop = agent, question, confirmed, should_stop
+
+    def run(self):
+        try:
+            backend.agent_run(self.agent, self.question, self.confirmed, self.event.emit, self.should_stop)
+        except Exception as e:  # noqa: BLE001 - reported in the chat, never silent
+            self.event.emit({"type": "answer", "status": "error", "text": f"{type(e).__name__}: {e}"})
+            self.event.emit({"type": "done"})
+
+
 def row(*widgets, spacing=8, stretch_first=False):
     h = QHBoxLayout()
     h.setContentsMargins(0, 0, 0, 0)
@@ -263,6 +304,8 @@ class MainWindow(QMainWindow):
         self.specs, self.param_widgets = [], {}
         self.summary, self.compare, self.timing = None, [], {}
         self.assistant = RuleBased(Agent(out_dir=str(backend.ROOT / "runs")))  # live only if .env KOLMO_LLM_LIVE=1 + key
+        self.zen, self._zen_blocked, self._agent_task, self._cancel, self._last_frame = False, False, None, False, None
+        self.tr = {"steps": [], "loss": [], "vsteps": [], "val": []}
         self._pending, self._agent_busy = None, False  # question awaiting run confirmation; one agent task at a time
         self._systems = backend.systems()
         self.threshold, self.drift_tol = backend.failure_threshold(), backend.drift_tol()
@@ -278,7 +321,7 @@ class MainWindow(QMainWindow):
         body.setSpacing(18)
         body.addWidget(self._build_nav())
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_simulate())
+        self.pages.addWidget(scroller(self._build_simulate()))  # only the centre scrolls
         self.pages.addWidget(self._build_experiments())
         self.pages.addWidget(self._build_models())
         self.pages.addWidget(self._build_geometry())
@@ -287,7 +330,8 @@ class MainWindow(QMainWindow):
         body.addWidget(self._build_side())
         root.addLayout(body, 1)
 
-        for key, fn in (("Space", self._space), ("R", self.reset), ("E", lambda: self.err_toggle.toggle())):
+        for key, fn in (("Space", self._space), ("R", self.reset), ("E", lambda: self.err_toggle.toggle()),
+                        ("Z", lambda: self.set_zen(not self.zen))):
             QShortcut(QKeySequence(key), self, activated=fn)
         self._on_system()
         self.reset()
@@ -327,9 +371,14 @@ class MainWindow(QMainWindow):
         self.act_anim.setChecked(self.backdrop.enabled)
         self.act_anim.toggled.connect(self._set_anim)
         menu.addSeparator()
-        menu.addAction("Shortcuts: Space run/pause · R reset · E error panel").setEnabled(False)
+        menu.addAction("Shortcuts: Space run/pause · R reset · E error panel · Z zen").setEnabled(False)
         gear.setMenu(menu)
         gear.setStyleSheet("QPushButton::menu-indicator { image: none; }")
+        self.zen_btn = button("◐  Zen", "chip", "Zen mode (Z): dim the background, hide secondary panels, "
+                              "enlarge the view and the chat")
+        self.zen_btn.setCheckable(True)
+        self.zen_btn.toggled.connect(lambda on: self.set_zen(on))
+        top.addWidget(self.zen_btn)
         top.addWidget(gear)
         return top
 
@@ -339,7 +388,9 @@ class MainWindow(QMainWindow):
 
     def _build_nav(self):
         c, v = card((12, 14, 12, 14), spacing=4)
-        c.setFixedWidth(214)
+        c.setMinimumWidth(214)
+        c.setMaximumWidth(214)
+        self.nav_card = c
         self.nav = QButtonGroup(self)
         for i, (key, icon, text) in enumerate(NAV):
             b = button(f"{icon}   {text}", "nav")
@@ -355,10 +406,8 @@ class MainWindow(QMainWindow):
 
     def _on_nav(self, i):
         key = NAV[i][0]
-        if key == "assistant":
-            self.side_tabs.button(1).click()
-            self.nav.button(0).setChecked(True)
-            self.pages.setCurrentIndex(0)
+        if key == "assistant":  # the assistant is always visible on the right: focus it
+            self.nav.button(self.pages.currentIndex() if self.pages.currentIndex() < 1 else 0).setChecked(True)
             self.chat_input.setFocus()
             return
         page = {"simulate": 0, "experiments": 1, "models": 2, "geometry": 3, "reports": 4}[key]
@@ -370,22 +419,27 @@ class MainWindow(QMainWindow):
             self._fill_reports()
         self.pages.setCurrentIndex(page)
 
-    # ------------------------------------------------------------ simulate page
     def _build_simulate(self):
         page = QWidget()
         page.setObjectName("page")
         v = QVBoxLayout(page)
-        v.setContentsMargins(0, 0, 0, 0)
+        v.setContentsMargins(0, 0, 6, 0)
         v.setSpacing(16)
+        self.setup_card = self._build_setup()
+        v.addWidget(self.setup_card)
 
         fields, fv = card((20, 16, 20, 14), spacing=10)
+        fields.setMinimumHeight(500)
         self.run_title = label("", squeeze=True)
         self.run_title.setStyleSheet("font-size: 17px; font-weight: 600;")
         self.pill = label("Idle", "pill")
+        self.field_sel = QComboBox()
+        self.field_sel.setToolTip("Field shown in the panels")
+        self.field_sel.currentIndexChanged.connect(lambda _: self._last_frame and self._show_fields(self._last_frame))
         self.err_toggle = button("Error panel", "chip", "Show |prediction − reference| (E)")
         self.err_toggle.setCheckable(True)
         self.err_toggle.toggled.connect(lambda on: self.err_view.setVisible(on))
-        fv.addLayout(row(self.run_title, self.err_toggle, self.pill, stretch_first=True))
+        fv.addLayout(row(self.run_title, self.field_sel, self.err_toggle, self.pill, stretch_first=True))
         self.run_sub = label("", "faint", squeeze=True)
         self.run_sub.setTextInteractionFlags(Qt.TextSelectableByMouse)
         fv.addWidget(self.run_sub)
@@ -405,10 +459,12 @@ class MainWindow(QMainWindow):
         self.scrub.setToolTip("Scrub through the recorded steps; drag to the end to follow the live run")
         self.scrub.valueChanged.connect(self._on_scrub)
         self.counter = label("", "counter")
-        fv.addLayout(row(self.play, self.stop_btn, 6, self.scrub, 10, self.counter, spacing=10, stretch_first=False))
-        v.addWidget(fields, 5)
+        fv.addLayout(row(self.play, self.stop_btn, 6, self.scrub, 10, self.counter, spacing=10))
+        v.addWidget(fields)
 
-        metrics = QHBoxLayout()
+        self.metrics_box = QWidget()
+        metrics = QHBoxLayout(self.metrics_box)
+        metrics.setContentsMargins(0, 0, 0, 0)
         metrics.setSpacing(14)
         self.m_err = MetricCard("◎", "Relative error", "‖prediction − reference‖ / ‖reference‖ at the shown step")
         self.m_drift = MetricCard("⚖", "Energy drift", "mean square of the prediction / of the reference − 1 "
@@ -417,11 +473,12 @@ class MainWindow(QMainWindow):
         self.m_horizon = MetricCard("∿", "Stability horizon", f"first step with relative error > {self.threshold:g}")
         for m in (self.m_err, self.m_drift, self.m_speed, self.m_horizon):
             metrics.addWidget(m)
-        v.addLayout(metrics)
+        v.addWidget(self.metrics_box)
 
         charts = QHBoxLayout()
         charts.setSpacing(14)
         ec, ev = card((20, 14, 16, 12), spacing=4)
+        ec.setMinimumHeight(300)
         self.clear_cmp = button("Clear comparison", "link", "Forget earlier runs in this chart", self._clear_compare)
         ev.addLayout(row(heading("Error over rollout"), None, self.clear_cmp))
         self.err_chart = LineChart(log=True, x_label="surrogate step")
@@ -429,6 +486,7 @@ class MainWindow(QMainWindow):
         ev.addWidget(self.err_chart, 1)
         charts.addWidget(ec, 3)
         dc, dv = card((20, 14, 16, 12), spacing=4)
+        self.diag_card = dc
         self.diag_key = QComboBox()
         self.diag_key.setMinimumWidth(130)
         self.diag_key.setToolTip("Quantity from system.diagnostics")
@@ -439,76 +497,71 @@ class MainWindow(QMainWindow):
         self.diag_chart = LineChart(x_label="surrogate step")
         dv.addWidget(self.diag_chart, 1)
         charts.addWidget(dc, 2)
-        v.addLayout(charts, 3)
+        v.addLayout(charts)
+        v.addWidget(self._build_training())
         return page
 
-    # ------------------------------------------------------------ right column: setup + assistant
     def _build_side(self):
         c, v = card((16, 14, 16, 16), spacing=10)
-        c.setFixedWidth(356)
-        self.side_tabs = QButtonGroup(self)
-        seg = QHBoxLayout()
-        seg.setSpacing(4)
-        for i, t in enumerate(("Setup", "Assistant")):
-            b = button(t, "seg")
-            b.setCheckable(True)
-            self.side_tabs.addButton(b, i)
-            seg.addWidget(b)
-        self.side_tabs.button(0).setChecked(True)
-        box = Glass(radius=12, level=1)
-        box.setLayout(seg)
-        seg.setContentsMargins(4, 4, 4, 4)
-        v.addWidget(box)
-        self.side = QStackedWidget()
-        self.side.addWidget(scroller(self._build_setup()))
-        self.side.addWidget(self._build_assistant())
-        self.side_tabs.idClicked.connect(self.side.setCurrentIndex)
-        v.addWidget(self.side, 1)
+        c.setMinimumWidth(380)
+        c.setMaximumWidth(380)
+        self.side_card = c
+        v.addWidget(self._build_assistant(), 1)
         return c
 
     def _build_setup(self):
-        w = QWidget()
-        w.setObjectName("page")
-        v = QVBoxLayout(w)
-        v.setContentsMargins(2, 0, 8, 0)
-        v.setSpacing(7)
+        """Setup card: parameters (auto-form from the system), obstacle and execution side by side, then Run."""
+        c, outer = card((20, 14, 20, 16), spacing=6)
+        self.system_note = label("", "faint", squeeze=True)
+        outer.addLayout(row(heading("Setup"), 12, self.system_note, stretch_first=False))
+        outer.itemAt(outer.count() - 1).layout().setStretch(2, 1)
+        h = QHBoxLayout()
+        h.setSpacing(26)
+        outer.addLayout(h)
         self.config_box = QWidget()
-        c = QVBoxLayout(self.config_box)
-        c.setContentsMargins(0, 0, 0, 0)
-        c.setSpacing(7)
-        v.addWidget(self.config_box)
+        cb = QHBoxLayout(self.config_box)
+        cb.setContentsMargins(0, 0, 0, 0)
+        cb.setSpacing(26)
+        h.addWidget(self.config_box, 1)
 
-        self.system_note = label("", "note", wrap=True)
-        c.addWidget(self.system_note)
-        c.addWidget(label("PARAMETERS", "section"))
+        a = QVBoxLayout()
+        a.setSpacing(6)
+        self.excl_sel = QComboBox()
+        self.excl_sel.setToolTip("Viscosity is set by one of the pair; the other follows from it")
+        self.excl_sel.currentIndexChanged.connect(lambda _: self._apply_exclusive())
+        a.addLayout(row(label("PARAMETERS", "section"), None, self.excl_sel))
         self.params_grid = QGridLayout()
         self.params_grid.setHorizontalSpacing(8)
         self.params_grid.setVerticalSpacing(6)
         self.params_grid.setColumnStretch(0, 1)
-        c.addLayout(self.params_grid)
-        self.seed = spin(0, 2 ** 31 - 1)
+        self.params_grid.setColumnStretch(2, 1)
+        a.addLayout(self.params_grid)
+        self.seed = spin(0, 2 ** 31 - 1, width=100)
         self.seed.setToolTip("Seed of system.initial: same seed, same initial condition")
-        c.addLayout(row(label("Random seed"), None, self.seed))
+        a.addLayout(row(label("Random seed"), None, self.seed))
+        a.addStretch(1)
+        cb.addLayout(a, 3)
 
-        c.addWidget(label("OBSTACLE", "section"))
+        b = QVBoxLayout()
+        b.setSpacing(6)
+        b.addWidget(label("OBSTACLE", "section"))
         self.obstacle = QComboBox()
         for _, t in OBSTACLES:
             self.obstacle.addItem(t)
         self.obstacle.activated.connect(self._on_obstacle)
-        self.obstacle_size = spin(0.02, 0.6, 2, width=70)
+        self.obstacle_size = spin(0.02, 0.6, 2, width=64)
         self.obstacle_size.setValue(0.2)
         self.obstacle_size.setToolTip("Diameter / side (photo: streamwise length) as a fraction of the domain side")
         self.obstacle_size.valueChanged.connect(self._update_thumb)
-        c.addLayout(row(self.obstacle, self.obstacle_size, stretch_first=True))
+        b.addLayout(row(self.obstacle, self.obstacle_size, stretch_first=True))
         self.thumb = QLabel()
-        self.thumb.setFixedSize(60, 60)
+        self.thumb.setFixedSize(44, 44)
         self.thumb.setStyleSheet("background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;")
         self.obstacle_note = label("", "note", wrap=True)
-        h = row(self.thumb, self.obstacle_note, spacing=10)
-        h.setStretch(1, 1)
-        c.addLayout(h)
-
-        c.addWidget(label("EXECUTION", "section"))
+        hh = row(self.thumb, self.obstacle_note, spacing=10)
+        hh.setStretch(1, 1)
+        b.addLayout(hh)
+        b.addWidget(label("EXECUTION", "section"))
         segbox = Glass(radius=11, level=1)
         seg = QHBoxLayout(segbox)
         seg.setContentsMargins(3, 3, 3, 3)
@@ -517,24 +570,24 @@ class MainWindow(QMainWindow):
         tips = ("Reference solver only", "Surrogate network rollout vs the reference",
                 "Surrogate with solver interventions (kolmo.hybrid)")
         for i, ((_, t), tip) in enumerate(zip(MODES, tips)):
-            b = button(t, "seg", tip)
-            b.setCheckable(True)
-            self.mode_group.addButton(b, i)
-            seg.addWidget(b)
+            bt = button(t, "seg", tip)
+            bt.setCheckable(True)
+            self.mode_group.addButton(bt, i)
+            seg.addWidget(bt)
         self.mode_group.button(0).setChecked(True)
         self.mode_group.idClicked.connect(lambda _: self._on_mode())
-        c.addWidget(segbox)
+        b.addWidget(segbox)
         self.exec_box = QWidget()
         g = QVBoxLayout(self.exec_box)
-        g.setContentsMargins(0, 4, 0, 0)
-        g.setSpacing(6)
+        g.setContentsMargins(0, 2, 0, 0)
+        g.setSpacing(5)
         self.ckpt = QComboBox()
         self.ckpt.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.ckpt.setMinimumContentsLength(12)
+        self.ckpt.setToolTip("Surrogate checkpoint (Models page: registry with metrics)")
         self.ckpt.currentIndexChanged.connect(lambda _: self._on_mode())
         self.ckpt_browse = button("…", tip="Choose a checkpoint (<name>.json next to <name>.npz)", slot=self._browse_ckpt)
         self.ckpt_browse.setFixedWidth(36)
-        g.addWidget(label("Surrogate checkpoint", "muted"))
         g.addLayout(row(self.ckpt, self.ckpt_browse, stretch_first=True))
         self.ckpt_note = label("", "note", wrap=True)
         g.addWidget(self.ckpt_note)
@@ -542,41 +595,49 @@ class MainWindow(QMainWindow):
         g.addWidget(self.use_train)
         self.policy_box = QWidget()
         pg = QGridLayout(self.policy_box)
-        pg.setContentsMargins(0, 6, 0, 0)
+        pg.setContentsMargins(0, 2, 0, 0)
         pg.setColumnStretch(0, 1)
-        pg.setVerticalSpacing(6)
-        pg.addWidget(label("Hybrid policy", "muted"), 0, 0, 1, 2)
-        self.pol_every = spin(0, 100000, special="off")
-        self.pol_res = spin(0, 100, 4, special="off")
-        self.pol_energy = spin(0, 100, 3, special="off")
+        pg.setVerticalSpacing(5)
+        self.pol_every = spin(0, 100000, special="off", width=80)
+        self.pol_res = spin(0, 100, 4, special="off", width=80)
+        self.pol_energy = spin(0, 100, 3, special="off", width=80)
         for i, (t, wdg, tip) in enumerate((
                 ("Re-anchor every", self.pol_every, "solver steps at steps N, 2N, ... (surrogate steps)"),
                 ("Residual tolerance", self.pol_res, "intervene when the physics residual of a proposal exceeds this"),
-                ("Energy tolerance", self.pol_energy, "intervene when |E/E₀ − 1| of a proposal exceeds this")), 1):
+                ("Energy tolerance", self.pol_energy, "intervene when |E/E₀ − 1| of a proposal exceeds this; "
+                                                      "non-finite proposals always trigger the solver")), 0):
             lab = label(t)
             lab.setToolTip(tip)
             wdg.setToolTip(tip)
             pg.addWidget(lab, i, 0)
             pg.addWidget(wdg, i, 1)
-        pg.addWidget(label("Non-finite proposals always trigger the solver.", "note", wrap=True), 4, 0, 1, 2)
         g.addWidget(self.policy_box)
-        c.addWidget(self.exec_box)
+        b.addWidget(self.exec_box)
         self.mode_note = label("", "note", wrap=True)
-        c.addWidget(self.mode_note)
+        b.addWidget(self.mode_note)
+        b.addStretch(1)
+        cb.addLayout(b, 2)
 
-        v.addWidget(label("RUN", "section"))
-        self.steps = spin(1, 1_000_000)
+        r = QVBoxLayout()
+        r.setSpacing(8)
+        r.addWidget(label("RUN", "section"))
+        self.steps = spin(1, 1_000_000, width=90)
         self.steps.setValue(400)
         self.steps.setToolTip("Surrogate steps (1 step = the checkpoint's spacing in solver steps; 1 in reference mode)")
-        v.addLayout(row(label("Steps"), None, self.steps))
+        r.addLayout(row(label("Steps"), None, self.steps))
         self.run_btn = button("Run", "primary", "Run (Space)", self.run)
-        v.addWidget(self.run_btn)
+        r.addWidget(self.run_btn)
         self.run_error = label("", "error", wrap=True)
         self.run_error.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(self.run_error)
-        v.addLayout(row(button("Save config…", slot=self._save_config), button("Open config…", slot=self._open_config)))
-        v.addStretch(1)
-        return w
+        r.addWidget(self.run_error)
+        r.addStretch(1)
+        r.addWidget(button("Save config…", slot=self._save_config))
+        r.addWidget(button("Open config…", slot=self._open_config))
+        side = QWidget()
+        side.setLayout(r)
+        side.setFixedWidth(170)
+        h.addWidget(side)
+        return c
 
     def _build_assistant(self):
         w = QWidget()
@@ -595,7 +656,30 @@ class MainWindow(QMainWindow):
         self.findings = QTextBrowser()
         self.findings.setOpenLinks(False)
         v.addWidget(self.findings, 3)
+        # agent activity: plan steps with live state, tool chips, progress
+        self.act_box, av = card((14, 10, 14, 10), spacing=5, radius=14, level=1)
+        self.agent_state = label("", "note", squeeze=True)
+        self.report_btn = button("Open report", "link", "Open the report of the last agent run", lambda: self._open_report(self._last_report))
+        self.report_btn.setVisible(False)
+        av.addLayout(row(heading("Agent activity", 13), 10, self.agent_state, self.report_btn, stretch_first=False))
+        av.itemAt(0).layout().setStretch(2, 1)
+        self.steps_box = QVBoxLayout()
+        self.steps_box.setSpacing(3)
+        av.addLayout(self.steps_box)
+        self.tool_chips = label("", wrap=True)
+        av.addWidget(self.tool_chips)
+        self.agent_bar = QProgressBar()
+        self.agent_bar.setTextVisible(False)
+        self.agent_bar.setFixedHeight(6)
+        self.agent_bar.setVisible(False)
+        av.addWidget(self.agent_bar)
+        self.act_box.setVisible(False)
+        v.addWidget(self.act_box)
+        self._step_rows, self._step_states, self._spin_i = [], [], 0
+        self._spinner = QTimer(self, interval=160, timeout=self._spin)
+        self._last_report = None
         pl, plv = card((14, 10, 14, 10), spacing=4, radius=14, level=1)
+        self.plan_card = pl
         plv.addWidget(heading("Plan", 13))
         self.plan_label = label("", "note", wrap=True)
         plv.addWidget(self.plan_label)
@@ -603,10 +687,10 @@ class MainWindow(QMainWindow):
         self.exp_btn = button("Run experiment", "primary", "Runs the current Setup (Space)", self.run)
         v.addWidget(self.exp_btn)
         self.chat_log = QTextBrowser()
-        self.chat_log.setMaximumHeight(130)
-        v.addWidget(self.chat_log, 1)
+        self.chat_log.setMinimumHeight(110)
+        v.addWidget(self.chat_log, 2)
         self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Ask: run, explain, plan, train…")
+        self.chat_input.setPlaceholderText("Ask: run, explain, plan, train, or a research question…")
         self.chat_input.returnPressed.connect(self._ask)
         send = button("➤", "roundPrimary", "Send", self._ask)
         v.addLayout(row(self.chat_input, send, stretch_first=True))
@@ -630,11 +714,7 @@ class MainWindow(QMainWindow):
         elif action in ("research", "confirm"):
             question, confirmed = (self._pending, True) if action == "confirm" else (text, False)
             self._pending, self._agent_busy = None, True
-            task = Task(lambda: self.assistant.agent.ask(question, confirmed, log=lambda *_: None))
-            task.ok.connect(lambda r, q=question: self._agent_done(q, r))
-            task.err.connect(lambda m: self._agent_done(question, {"status": "error", "text": m}))
-            self._keep(task)
-            task.start()
+            self._start_agent(question, confirmed)
         else:
             self._pending = None
 
@@ -651,6 +731,244 @@ class MainWindow(QMainWindow):
         self._say("", r["text"] + (f"\n\nSaved: {r['report']}" if r.get("report") else ""))
         if r.get("report"):
             self._fill_experiments()
+
+    # ------------------------------------------------------------ agent activity
+    def _start_agent(self, question, confirmed):
+        self._cancel = False
+        self._set_steps([])
+        self.tool_chips.setText("")
+        self.agent_bar.setVisible(False)
+        self.report_btn.setVisible(False)
+        self.act_box.setVisible(True)
+        self.agent_state.setText("working…")
+        task = AgentTask(self.assistant.agent, question, confirmed, lambda: self._cancel)
+        self._agent_task = task
+        task.event.connect(lambda ev, t=task, q=question: self._agent_event(ev, q) if t is self._agent_task else None)
+        self._keep(task)
+        task.start()
+        self.train_cancel.setEnabled(backend.can_cancel_agent(self.assistant.agent))
+
+    def _set_steps(self, steps):
+        while self.steps_box.count():
+            it = self.steps_box.takeAt(0)
+            if it.layout():
+                while it.layout().count():
+                    w = it.layout().takeAt(0).widget()
+                    if w:
+                        w.setParent(None)
+        self._step_rows, self._step_states = [], []
+        for text in steps:
+            icon, lab = label("○"), label(text, "note", wrap=True)
+            icon.setFixedWidth(18)
+            icon.setStyleSheet(f"font-family: '{SYMBOL_FONT}'; color: {FAINT};")
+            h = row(icon, lab, spacing=6)
+            h.setStretch(1, 1)
+            self.steps_box.addLayout(h)
+            self._step_rows.append((icon, lab))
+            self._step_states.append("pending")
+        if steps:
+            self._step_state(0, "running")
+
+    def _step_state(self, i, state):
+        if not 0 <= i < len(self._step_rows):
+            return
+        self._step_states[i] = state
+        icon, lab = self._step_rows[i]
+        glyph, col = {"pending": ("○", FAINT), "running": ("◐", ACCENT2), "done": ("✓", OK), "failed": ("✕", FAIL)}[state]
+        icon.setText(glyph)
+        icon.setStyleSheet(f"font-family: '{SYMBOL_FONT}'; color: {col};")
+        lab.setStyleSheet(f"color: {TEXT if state == 'running' else MUTED};")
+        if "running" in self._step_states:
+            self._spinner.start()
+        else:
+            self._spinner.stop()
+
+    def _spin(self):
+        self._spin_i = (self._spin_i + 1) % 4
+        for (icon, _), st in zip(self._step_rows, self._step_states):
+            if st == "running":
+                icon.setText("◐◓◑◒"[self._spin_i])
+
+    def _advance(self, ok=True):
+        i = next((k for k, st in enumerate(self._step_states) if st == "running"), None)
+        if i is None:
+            return
+        self._step_state(i, "done" if ok else "failed")
+        if ok and i + 1 < len(self._step_states):
+            self._step_state(i + 1, "running")
+
+    def _agent_event(self, ev, question):
+        t = ev.get("type")
+        if t == "plan":
+            self._set_steps([str(x) for x in ev.get("steps", [])])
+        elif t == "status":
+            self.agent_state.setText(str(ev.get("text", "")))
+        elif t == "tool":
+            ok = bool(ev.get("ok", True))
+            col = OK if ok else FAIL
+            chip = (f"<span style='background: rgba(255,255,255,0.08); color:{col}; border-radius:8px'>&nbsp;"
+                    f"{'✓' if ok else '✕'} {html.escape(str(ev.get('name')))}&nbsp;</span>&nbsp; ")
+            self.tool_chips.setText(self.tool_chips.text() + chip)
+            self.tool_chips.setToolTip(str(ev.get("summary", "")))
+            self._advance(ok)
+        elif t == "progress":
+            self._on_progress(ev)
+        elif t == "result":
+            m = ev.get("metrics") or {}
+            if m:
+                self._say("", "Result: " + ", ".join(f"{k} = {fmt(v) if isinstance(v, float) else v}" for k, v in m.items()))
+            if ev.get("report"):
+                self._last_report = ev["report"]
+                self.report_btn.setVisible(True)
+        elif t == "zen":
+            self.set_zen(bool(ev.get("on")), source="agent")
+        elif t == "error":
+            self._say("", f"Error: {ev.get('text', '')}")
+            i = next((k for k, st in enumerate(self._step_states) if st == "running"), None)
+            if i is not None:
+                self._step_state(i, "failed")
+        elif t == "answer":
+            if ev.get("report"):
+                self._last_report = ev["report"]
+                self.report_btn.setVisible(True)
+            self._agent_done(question, ev)
+        elif t == "done":
+            for i, st in enumerate(self._step_states):
+                if st == "running":
+                    self._step_state(i, "done")
+            self._agent_busy = False
+            self.agent_state.setText("done")
+            self.train_cancel.setEnabled(False)
+
+    # ------------------------------------------------------------ training panel
+    def _build_training(self):
+        c, v = card((20, 14, 20, 14), spacing=6)
+        c.setMinimumHeight(290)
+        self.train_card = c
+        self.phase_chips = {}
+        chips = []
+        for ph in ("data", "train", "eval"):
+            lab = label(ph, "pill")
+            lab.setToolTip({"data": "generating reference trajectories", "train": "optimising the network",
+                            "eval": "rolling out and scoring"}[ph])
+            self.phase_chips[ph] = lab
+            chips.append(lab)
+        self.train_eta = label("", "counter")
+        self.train_eta.setMinimumWidth(190)
+        self.train_eta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.train_cancel = button("Cancel", tip="Ask the running training to stop at its next check",
+                                   slot=lambda: (setattr(self, "_cancel", True), self.train_cancel.setEnabled(False)))
+        self.train_cancel.setEnabled(False)
+        v.addLayout(row(heading("Training"), 12, *chips, None, self.train_eta, self.train_cancel))
+        self.train_summary = label("", "muted", squeeze=True)
+        v.addWidget(self.train_summary)
+        self.train_bar = QProgressBar()
+        self.train_bar.setTextVisible(False)
+        self.train_bar.setFixedHeight(6)
+        v.addWidget(self.train_bar)
+        h = QHBoxLayout()
+        h.setSpacing(14)
+        self.loss_chart = LineChart(log=True, x_label="optimiser step")
+        self.val_chart = LineChart(log=True, x_label="optimiser step")
+        h.addWidget(self.loss_chart)
+        h.addWidget(self.val_chart)
+        v.addLayout(h, 1)
+        self._reset_training()
+        return c
+
+    def _reset_training(self):
+        self.tr = {"steps": [], "loss": [], "vsteps": [], "val": []}
+        for ph, lab in self.phase_chips.items():
+            lab.setStyleSheet(f"color: {FAINT}; border: 1px solid rgba(255,255,255,0.15);")
+        self.train_eta.setText("")
+        self.train_bar.setValue(0)
+        self.train_summary.setText("No training running. Progress (loss, validation rollout error, ETA) appears here when "
+                                   "the assistant trains a model.")
+        self.loss_chart.clear("Training loss per optimiser step")
+        self.val_chart.clear("Validation rollout error per evaluation")
+
+    def _on_progress(self, d):
+        """Training progress dict (docs/contracts.md): phase, step, total, loss, val_rollout_error, eta_s."""
+        ph = d.get("phase")
+        for name, lab in self.phase_chips.items():
+            on = name == ph
+            lab.setStyleSheet(f"color: {TEXT if on else FAINT}; border: 1px solid {ACCENT2 if on else 'rgba(255,255,255,0.15)'};"
+                              + (" background: rgba(124,92,255,0.35);" if on else ""))
+        step, total = d.get("step"), d.get("total")
+        if step is not None and total:
+            self.train_bar.setRange(0, int(total))
+            self.train_bar.setValue(int(step))
+            self.agent_bar.setVisible(True)
+            self.agent_bar.setRange(0, int(total))
+            self.agent_bar.setValue(int(step))
+        eta = d.get("eta_s")
+        self.train_eta.setText(("" if step is None else f"{step}/{total}   ") +
+                               (f"ETA {int(eta // 60)}:{int(eta % 60):02d}" if isinstance(eta, (int, float)) else ""))
+        if ph == "train" and d.get("loss") is not None and step is not None:
+            self.tr["steps"].append(step)
+            self.tr["loss"].append(float(d["loss"]))
+        if d.get("val_rollout_error") is not None and step is not None:
+            self.tr["vsteps"].append(step)
+            self.tr["val"].append(float(d["val_rollout_error"]))
+        self.loss_chart.xmax = self.val_chart.xmax = total or 1
+        self.loss_chart.series = {"train loss": (ACCENT2, self.tr["steps"], self.tr["loss"], False, 2.0)}
+        self.val_chart.series = {"val rollout error": (REF, self.tr["vsteps"], self.tr["val"], False, 2.0)}
+        self.loss_chart.update()
+        self.val_chart.update()
+        self.train_summary.setText(f"{ph or ''} · " + training_summary(self.tr["val"], self.tr["loss"]))
+
+    # ------------------------------------------------------------ zen mode
+    def set_zen(self, on, source="user"):
+        """Zen: dim the backdrop, hide secondary panels, widen the view and the chat (250 ms). An agent's zen-on is
+        ignored after the user turned zen off during its task, until the user turns zen on again."""
+        if source == "agent":
+            if on and self._zen_blocked:
+                return
+        else:
+            self._zen_blocked = (not on) and self._agent_busy
+        if on == self.zen:
+            return
+        self.zen = on
+        self.zen_btn.blockSignals(True)
+        self.zen_btn.setChecked(on)
+        self.zen_btn.blockSignals(False)
+        for w in (self.setup_card, self.metrics_box, self.diag_card):
+            w.setVisible(not on)
+        if not on:
+            self.nav_card.setVisible(True)
+        group = QParallelAnimationGroup(self)
+        for w, prop, a, b in ((self.nav_card, b"minimumWidth", 214, 0), (self.nav_card, b"maximumWidth", 214, 0),
+                              (self.side_card, b"minimumWidth", 380, 520), (self.side_card, b"maximumWidth", 380, 520)):
+            an = QPropertyAnimation(w, prop, group)
+            an.setDuration(250)
+            an.setEasingCurve(QEasingCurve.OutCubic)
+            an.setStartValue(a if on else b)
+            an.setEndValue(b if on else a)
+            group.addAnimation(an)
+        dim = QVariantAnimation(group)
+        dim.setDuration(250)
+        dim.setStartValue(0.0 if on else 1.0)
+        dim.setEndValue(1.0 if on else 0.0)
+        dim.valueChanged.connect(self.backdrop.set_dim)
+        group.addAnimation(dim)
+        group.finished.connect(lambda: self.nav_card.setVisible(not self.zen))
+        group.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _open_report(self, path):
+        if not path or not Path(path).exists():
+            return
+        d = QDialog(self)
+        d.setWindowTitle(Path(path).name)
+        d.resize(860, 720)
+        d.setStyleSheet(QSS + "QDialog { background: #120c30; }")
+        lay = QVBoxLayout(d)
+        tb = QTextBrowser()
+        tb.setOpenLinks(False)
+        tb.setSearchPaths([str(Path(path).parent)])
+        tb.setMarkdown(Path(path).read_text(encoding="utf-8"))
+        lay.addWidget(tb)
+        d.show()
+        self._report_dialog = d
 
     # ------------------------------------------------------------ other pages (read from run files, never invented)
     def _page(self, title, subtitle):
@@ -689,22 +1007,171 @@ class MainWindow(QMainWindow):
         self.exp_view.setHtml("".join(out))
 
     def _build_models(self):
-        c, v = self._page("Models", "Surrogate checkpoints found under runs/ and checkpoints/ (kolmo.surrogates.train "
-                                    "format), with what they were trained on.")
-        self.models_view = QTextBrowser()
-        v.addWidget(self.models_view, 1)
+        c, v = self._page("Models", "Trained surrogates: the model registry (runs/registry.json) plus checkpoints on disk "
+                                    "not registered yet. Metrics are the experiment's test-set numbers.")
+        self.mdl_filter = QComboBox()
+        self.mdl_filter.addItem("All systems", None)
+        for lbl, s_, _ in self._systems:
+            if s_ is not None:
+                self.mdl_filter.addItem(lbl, s_.name)
+        self.mdl_filter.currentIndexChanged.connect(lambda _: self._fill_models())
+        v.addLayout(row(label("System"), self.mdl_filter, None))
+        h = QHBoxLayout()
+        h.setSpacing(18)
+        self.mdl_list = QListWidget()
+        self.mdl_list.currentRowChanged.connect(self._on_model)
+        h.addWidget(self.mdl_list, 3)
+        d = QVBoxLayout()
+        d.setSpacing(8)
+        self.mdl_info = QTextBrowser()
+        d.addWidget(self.mdl_info, 1)
+        self.mdl_steps = spin(1, 100000, width=90)
+        self.mdl_steps.setValue(100)
+        self.mdl_run = button("Run vs reference", "primary", "Roll out this model next to the reference solver",
+                              self._run_model)
+        self.mdl_report = button("Open report", slot=lambda: self._open_report(self._model()["report"]))
+        self.mdl_register = button("Register", tip="Add this checkpoint to the model registry", slot=self._register_model)
+        d.addLayout(row(label("Steps"), None, self.mdl_steps))
+        d.addWidget(self.mdl_run)
+        d.addLayout(row(self.mdl_report, self.mdl_register))
+        h.addLayout(d, 2)
+        v.addLayout(h, 1)
+        tr, tv = card((16, 12, 16, 12), spacing=6, radius=14, level=1)
+        self.trn_sys = QComboBox()
+        for lbl, s_, _ in self._systems:
+            if s_ is not None:
+                self.trn_sys.addItem(lbl, s_.name)
+        self.trn_kind = QComboBox()
+        for k in backend.TRAIN_KINDS + ("latent",):
+            self.trn_kind.addItem(k, k)
+        self.trn_kind.setToolTip("latent: " + backend.TRAIN_HELP_LATENT)
+        self.trn_budget = spin(10, 100000, width=90)
+        self.trn_budget.setValue(300)
+        self.trn_budget.setToolTip("Optimiser steps (upper bound; early stopping may end sooner)")
+        self.trn_btn = button("Train", "primary", "Generate reference data with the Simulate parameters of this system, "
+                              "fit, save and register; progress in the Training panel", self._train)
+        self.trn_note = label("Uses the Simulate parameters when the system matches, else the system defaults.", "note", wrap=True)
+        tv.addLayout(row(heading("Train new", 13), 10, label("System"), self.trn_sys, label("Kind"), self.trn_kind,
+                         label("Budget"), self.trn_budget, None, self.trn_btn))
+        tv.addWidget(self.trn_note)
+        v.addWidget(tr)
+        self._models = []
         return c
 
     def _fill_models(self):
-        cks = backend.all_checkpoints()
-        if not cks:
-            self.models_view.setHtml(f"<p style='color:{MUTED}'>{html.escape(backend.TRAIN_HELP)}</p>")
+        try:
+            self._models = backend.models(self.mdl_filter.currentData())
+        except Exception as e:  # noqa: BLE001
+            self._models = []
+            self.mdl_info.setHtml(self._html_note(f"Cannot read the registry: {e}"))
+        self.mdl_list.clear()
+        for e in self._models:
+            m = e.get("metrics") or {}
+            one = m.get("one_step")
+            it = QListWidgetItem(f"{e['name']}   ·   {e['kind']}   ·   {e['system']}"
+                                 + (f"   ·   1-step error {fmt(one)}" if isinstance(one, (int, float)) else "")
+                                 + ("" if e.get("registered", True) else "   ·   not registered"))
+            it.setToolTip(str(e.get("path")))
+            self.mdl_list.addItem(it)
+        if self._models:
+            self.mdl_list.setCurrentRow(0)
+        else:
+            self.mdl_info.setHtml(self._html_note(backend.TRAIN_HELP))
+        self._on_model(self.mdl_list.currentRow())
+
+    def _train(self):
+        name, kind, budget = self.trn_sys.currentData(), self.trn_kind.currentData(), self.trn_budget.value()
+        s_ = next(x for _, x, _ in self._systems if x is not None and x.name == name)
+        params = self._params() if self.current_system().name == name else {}
+        self._cancel = False
+        self._reset_training()
+        self.trn_btn.setEnabled(False)
+        self.train_cancel.setEnabled(True)
+        self.trn_note.setText(f"Training {kind} on {name} for up to {budget} steps… (Training panel in Simulate)")
+        task = TrainTask(lambda prog: backend.train_model(s_, params, kind, budget, prog, lambda: self._cancel))
+        task.progress.connect(self._on_progress)
+        task.ok.connect(self._train_done)
+        task.err.connect(self._train_failed)
+        self._train_task = task
+        self._keep(task)
+        task.start()
+
+    def _train_done(self, entry):
+        self.trn_btn.setEnabled(True)
+        self.train_cancel.setEnabled(False)
+        hist = entry.get("history") or [{}]
+        val = hist[-1].get("val_rollout_rel_l2")
+        stopped = hist[-1].get("stopped")
+        msg = (f"Saved and registered {entry.get('id', entry.get('path'))}"
+               + (f"; last val rollout error {val:.3g}" if isinstance(val, (int, float)) else "")
+               + (f" (stopped: {stopped})" if stopped else ""))
+        self.trn_note.setText(msg)
+        self.train_summary.setText("done · " + self.train_summary.text().split(" · ", 1)[-1])
+        self._say("", msg)
+        if self.pages.currentIndex() == 2:
+            self._fill_models()
+        if self.trn_sys.currentData() == self.current_system().name:
+            self._refresh_ckpts()
+
+    def _train_failed(self, msg):
+        self.trn_btn.setEnabled(True)
+        self.train_cancel.setEnabled(False)
+        self.trn_note.setText(f"Training failed: {msg}")
+
+    def _model(self):
+        i = self.mdl_list.currentRow()
+        return self._models[i] if 0 <= i < len(self._models) else None
+
+    def _on_model(self, _):
+        e = self._model()
+        for b in (self.mdl_run, self.mdl_report, self.mdl_register):
+            b.setEnabled(e is not None)
+        if e is None:
             return
-        self.models_view.setHtml("".join(
-            f"<h3 style='margin-bottom:2px'>{html.escape(lbl)} <span style='color:{MUTED}; font-weight:400'>· "
-            f"{html.escape(sys_)}</span></h3><div style='color:{FAINT}'>{html.escape(stem)}</div>"
-            f"<div style='color:{MUTED}'>{html.escape(backend.describe_checkpoint(stem)).replace(chr(10), '<br>')}</div>"
-            for sys_, lbl, stem in cks))
+        self.mdl_report.setEnabled(bool(e.get("report")))
+        self.mdl_register.setVisible(not e.get("registered", True))
+        m = e.get("metrics") or {}
+        rows = "".join(f"<tr><td style='color:{MUTED}; padding:2px 12px 2px 0'>{html.escape(k)}</td><td>"
+                       f"{html.escape(fmt(v) if isinstance(v, float) else str(v))}</td></tr>" for k, v in m.items()
+                       if v is not None)
+        try:
+            desc = backend.describe_checkpoint(e["path"]).replace("\n", "<br>")
+        except (OSError, ValueError, KeyError):
+            desc = ""
+        self.mdl_info.setHtml(f"<h3>{html.escape(e['name'])}</h3><div style='color:{FAINT}'>{html.escape(str(e['id']))}"
+                              f" · {html.escape(str(e.get('created', '')))}</div><div style='color:{MUTED}; margin:6px 0'>"
+                              f"{desc}</div><table>{rows or '<tr><td>no test metrics recorded</td></tr>'}</table>")
+
+    def _run_model(self):
+        e = self._model()
+        if e is None:
+            return
+        idx = next((i for i, (_, s_, _) in enumerate(self._systems) if s_ is not None and s_.name == e["system"]), None)
+        if idx is None:
+            self.mdl_info.append(self._html_note(f"System {e['system']} is not available."))
+            return
+        self.system.setCurrentIndex(idx)
+        i = self.ckpt.findData(e["path"])
+        if i < 0:
+            self.ckpt.insertItem(0, e["name"], e["path"])
+            i = 0
+        self.ckpt.setCurrentIndex(i)
+        self._use_training_params()
+        self.mode_group.button(1).setChecked(True)
+        self._on_mode()
+        self.steps.setValue(self.mdl_steps.value())
+        self.nav.button(0).setChecked(True)
+        self.pages.setCurrentIndex(0)
+        self.run()
+
+    def _register_model(self):
+        e = self._model()
+        try:
+            backend.register_model(e["path"])
+        except Exception as ex:  # noqa: BLE001
+            self.mdl_info.append(self._html_note(f"Register failed: {ex}"))
+            return
+        self._fill_models()
 
     def _build_geometry(self):
         c, v = self._page("Geometry", "Photo → object mask (SAM 3 when installed, else OpenCV GrabCut) → obstacle grid "
@@ -779,7 +1246,7 @@ class MainWindow(QMainWindow):
             if w:
                 w.setParent(None)  # off screen now; deleteLater alone leaves it drawn until the next event loop pass
                 w.deleteLater()
-        self.specs, self.param_widgets = backend.param_specs(s), {}
+        self.specs, self.param_widgets, self.param_labels = backend.param_specs(s), {}, {}
         d = backend.defaults(s)
         for i, sp in enumerate(self.specs):
             unit = f"  <span style='color:{FAINT}'>{sp.unit}</span>" if sp.unit else ""
@@ -787,19 +1254,34 @@ class MainWindow(QMainWindow):
             lab.setToolTip(sp.tip)
             if sp.choices:
                 w = QComboBox()
-                w.setFixedWidth(112)
+                w.setFixedWidth(100)
                 if sp.auto:
                     w.addItem(AUTO, AUTO)
                 for ch in sp.choices:
                     w.addItem(str(ch).replace("_", " "), ch)
             else:
-                w = spin(sp.lo, sp.hi, sp.decimals, AUTO if sp.auto else None)
+                w = spin(sp.lo, sp.hi, sp.decimals, AUTO if sp.auto else None, width=100)
             w.setToolTip(sp.tip)
             self._set_value(w, d.get(sp.key))
-            self.params_grid.addWidget(lab, i, 0)
-            self.params_grid.addWidget(w, i, 1)
+            self.param_labels[sp.key] = lab
+            self.params_grid.addWidget(lab, i // 2, (i % 2) * 2)
+            self.params_grid.addWidget(w, i // 2, (i % 2) * 2 + 1)
             self.param_widgets[sp.key] = w
         self.system_note.setText(backend.describe(s))
+        pair = [k for k in backend.exclusive(s) if k in self.param_widgets]
+        self.excl_sel.blockSignals(True)
+        self.excl_sel.clear()
+        for k in pair:
+            self.excl_sel.addItem(f"set by {'ν' if k == 'nu' else k}", k)
+        self.excl_sel.setVisible(len(pair) == 2)
+        self.excl_sel.blockSignals(False)
+        self._apply_exclusive()
+        self.system_note.setToolTip(backend.describe(s))
+        self.field_sel.blockSignals(True)
+        self.field_sel.clear()
+        self.field_sel.addItems(list(s.fields))
+        self.field_sel.setVisible(len(s.fields) > 1)
+        self.field_sel.blockSignals(False)
         self.cbar.symbol = {"vorticity": "ω", "temperature": "T"}.get(s.fields[0], s.fields[0][:1])
         self.photo, self.compare = None, []  # curves of another system are not comparable
         self._refresh_ckpts()
@@ -818,12 +1300,22 @@ class MainWindow(QMainWindow):
         else:
             w.setValue(w.minimum() if v is None else v)
 
+    def _apply_exclusive(self):
+        pair = [self.excl_sel.itemData(i) for i in range(self.excl_sel.count())]
+        for k in pair:
+            on = k == self.excl_sel.currentData()
+            self.param_widgets[k].setVisible(on)
+            self.param_labels[k].setVisible(on)
+
     def _params(self):
         out = {}
         for sp in self.specs:
             w = self.param_widgets[sp.key]
             v = w.currentData() if isinstance(w, QComboBox) else w.value()
             out[sp.key] = None if sp.auto and (v == AUTO or (not isinstance(w, QComboBox) and v == w.minimum())) else v
+        for i in range(self.excl_sel.count()):  # only the selected member of an exclusive pair is sent
+            if self.excl_sel.itemData(i) != self.excl_sel.currentData():
+                out[self.excl_sel.itemData(i)] = None
         return out
 
     def _update_obstacle_ui(self):
@@ -1071,7 +1563,7 @@ class MainWindow(QMainWindow):
             self.runner.stopped = True
             self.runner = None
         self.xs, self.err, self.diag_ref, self.diag_cand = [], [], {}, {}
-        self.scale = self.run_obstacle = self.live = None
+        self.scale = self.run_obstacle = self.live = self._last_frame = None
         self.spacing, self.summary, self.timing, self.horizon = 1, None, {}, None
         self._set_running(False)
         self.run_error.setText("")
@@ -1195,8 +1687,11 @@ class MainWindow(QMainWindow):
         self._update_metrics(fr)
 
     def _show_fields(self, fr):
-        name = self.current_system().fields[0]
-        r, c = fr.reference[0], None if fr.candidate is None else fr.candidate[0]
+        self._last_frame = fr
+        fi = max(0, self.field_sel.currentIndex())
+        name = self.current_system().fields[fi]
+        self.cbar.symbol = {"vorticity": "ω", "temperature": "T"}.get(name, name[:2])
+        r, c = fr.reference[fi], None if fr.candidate is None else fr.candidate[fi]
         lo, hi = float(np.nanmin(r)), float(np.nanmax(r))
         if self.scale is None:
             self.scale = ("seq" if 0 <= lo < hi else "div", lo, hi)  # signed or all-zero -> diverging
@@ -1332,7 +1827,6 @@ class MainWindow(QMainWindow):
         self._set_status("Error", FAIL)
         self.counter.setText("")
         self.run_error.setText(msg)
-        self.side_tabs.button(0).click()
         self.findings.setHtml(self._html_note("The run did not start; see the message under Run in Setup."))
 
     def closeEvent(self, e):
