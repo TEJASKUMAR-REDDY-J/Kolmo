@@ -27,8 +27,8 @@ video.
 | **CARD** | 0:26–0:31 | 5 s | **Your "live demo" card.** No voice: whoosh + bass hit (see ideas) | 0 |
 | 3 | 0:31–0:55 | 24 s | `tour/01_photo_wind_tunnel.mp4`: type "car" → Find it with SAM 3.1 → glow mask → Run wind tunnel → Zen | ~20 s |
 | 4 | 0:55–1:17 | 22 s | `tour/08_assistant_autonomous.mp4`: typing the task (6 s), then a zoom on the agent panel as the plan ticks off, a failed step is retried, and the report is written | ~19 s |
-| 5 | 1:17–1:39 | 22 s | `tour/07_models_ai_vs_solver.mp4` (9 s) → `clips/ai_vs_truth.mp4` (6 s) → `tour/06_experiments.mp4` leaderboard (7 s) | ~20 s |
-| 6 | 1:39–1:59 | 20 s | Montage cut on the beat: `rings3d` → `02_heated_plumes` → `heat_rt` → `04_cyclones` → `gray_scott` → `cahn_hilliard` | ~12 s |
+| 5 | 1:17–1:39 | 22 s | `clips/ai_vs_truth.mp4` (6 s) → `tour/06_experiments.mp4` leaderboard showing 145.5 (7 s) → `tour/07_models_ai_vs_solver.mp4`, the turbulence error map (9 s) | ~20 s |
+| 6 | 1:39–1:59 | 20 s | Montage cut on the beat: `rings3d` → `tour/02_heated_plumes` → `heat_rt` → `tour/05_gray_scott` → `cyclone` → `cahn_hilliard` | ~13 s |
 | 7 | 1:59–2:17 | 18 s | `clips/rings3d.mp4` (8 s) → `tour/03_rayleigh_taylor.mp4` in Zen (10 s) | ~15 s |
 | 8 | 2:17–2:40 | 23 s | `clips/car_tunnel.mp4` with a slow push-in → end card ("Kolmo · Know when to trust your AI simulator · Built on Meta AI") at 2:34 | ~16 s |
 
@@ -36,48 +36,66 @@ video.
 
 ## Voiceover, one clip per scene
 
-**Scene 1 (starts 0:00)**
-> One photo. <break time="0.4s" /> One word. <break time="0.4s" /> A wind tunnel.
+Write-up style: one continuous story, spoken by you in the first person. The problem leads to the idea, the demo
+proves it, the twist is about trust, and the close calls back to the opening. Each scene's last line hands over to
+the next one, so the clips sound like one take.
 
-**Scene 2 (starts 0:08)**
-> Every car, every chip, every turbine is shaped by simulations that take experts and hours of compute.
-> <break time="0.4s" /> AI makes them fast. <break time="0.3s" /> But AI fails silently, and nobody tells you
-> when. <break time="0.7s" /> Kolmo does.
+**Scene 1 (0:00, about 4 s)**
+> What if you could drop a photo… <break time="0.3s" /> into a wind tunnel?
+
+**Scene 2 (0:08, about 16 s)**
+> Cars, chips, turbines: they're all designed with physics simulations that take hours to run. <break time="0.3s" />
+> AI can do it faster. <break time="0.4s" /> The catch? <break time="0.3s" /> It drifts, and it never tells you when.
+> <break time="0.5s" /> So we built Kolmo: a physics lab where the AI has to prove it's right.
 
 **CARD (0:26–0:31): no voice.**
 
-**Scene 3 (starts 0:31)**
-> Any photo. Name it. <break time="0.3s" /> Meta's Segment Anything 3.1 runs right here on the laptop and finds
-> the car from one word. <break time="0.3s" /> Kolmo levels it, puts it on the road, and turns it into a solid body
-> inside a real Navier–Stokes solver. <break time="0.6s" /> One click. <break time="0.4s" /> And the wind hits.
+**Scene 3 (0:31, about 20 s)**
+> Here's the car from that photo. I type one word: car. <break time="0.3s" /> Meta's SAM 3.1, running right on this
+> laptop, cuts it out. <break time="0.2s" /> Kolmo straightens it, sets it on the road, and drops it into a real
+> fluid solver. <break time="0.4s" /> One click, and you watch the wake peel off the roof.
 
-**Scene 4 (starts 0:55)**
-> Or don't click at all. Just ask. <break time="0.3s" /> Meta's Llama Prompt Guard screens the request first.
-> Then the agent takes over: it plans the study, generates the data, trains the models, fixes its own failed steps,
-> and writes the report. <break time="0.3s" /> And it can't bluff: any number it can't prove gets flagged.
+**Scene 4 (0:55, about 19 s)**
+> Want to go further? <break time="0.2s" /> Just ask. <break time="0.3s" /> Meta's Llama Prompt Guard checks the
+> request, then the agent runs the whole study on its own: data, training, testing. <break time="0.3s" /> When a step
+> fails, it fixes it. <break time="0.2s" /> And every number in its report has to come from a real measurement.
 
-**Scene 5 (starts 1:17)**
-> Now the part every other AI tool hides. <break time="0.4s" /> Left: the exact physics. Middle: a tiny neural
-> network. On these patterns, it holds for a hundred and forty-five steps, at three tenths of a percent error.
-> <break time="0.4s" /> On turbulence, every model breaks within about twenty steps. <break time="0.3s" /> Kolmo
-> doesn't hide that. It shows you exactly where.
+**Scene 5 (1:17, about 20 s)**
+> Because that's the real question: <break time="0.2s" /> how long can you trust the AI? <break time="0.4s" /> Here's
+> the solver and the neural network, side by side. On patterns like these, the AI holds up: the best one lasts a
+> hundred and forty-five steps, at under half a percent error. <break time="0.3s" /> On turbulence, it breaks in about
+> twenty, and Kolmo shows you exactly where.
 
-**Scene 6 (starts 1:39), with the montage cuts on the beat**
-> Full 3D vortex rings. <break time="0.7s" /> Rising heat. <break time="0.7s" /> Storms on a spinning planet.
-> <break time="0.7s" /> Patterns that copy themselves. <break time="0.7s" /> Type an equation, and Kolmo builds the
-> solver.
+**Scene 6 (1:39, about 13 s; each phrase lands on a montage cut)**
+> And it's not just air. <break time="0.5s" /> Full 3D turbulence. <break time="0.5s" /> Rising heat.
+> <break time="0.5s" /> Patterns that copy themselves. <break time="0.5s" /> Storms on a spinning planet.
+> <break time="0.5s" /> Type in an equation, and Kolmo builds the solver.
 
-**Scene 7 (starts 1:59)**
-> Under the hood: spectral solvers in JAX, each checked against exact answers. Neural models that learn the physics.
-> And a hybrid mode where the real solver steps in the moment the AI drifts. <break time="0.3s" /> The physics and the
-> AI run on one laptop CPU.
+**Scene 7 (1:59, about 13 s)**
+> Under the hood, every solver is checked against exact answers, <break time="0.2s" /> and the moment the AI starts to
+> drift, the real physics steps back in. <break time="0.3s" /> The physics and the AI run on a single laptop.
 
-**Scene 8 (starts 2:17)**
-> Fast simulation is easy to fake. Trust isn't. <break time="0.5s" /> Kolmo gives engineers, students and
-> researchers both, and answers the one question that matters. <break time="0.7s" /> When does it stop being right?
-> <break time="1.2s" /> Kolmo. <break time="0.4s" /> Built on Meta AI.
+**Scene 8 (2:17, about 18 s)**
+> Fast answers are easy. <break time="0.3s" /> Trustworthy ones aren't. <break time="0.5s" /> Kolmo gives you both,
+> so the next time an AI tells you how the air will flow, <break time="0.2s" /> you'll know exactly how far to
+> believe it. <break time="1.2s" /> Kolmo. <break time="0.4s" /> Built on Meta AI.
 
----
+All in one go (if you'd rather generate a single file and cut it yourself): paste the eight blocks in order, without
+the scene headers.
+
+## 2:13 version (current edit)
+
+| # | Starts | Length | Voice (about 150 words a minute) |
+|---|---|---|---|
+| 1 | 0:00 | 7 s | What if you could drop a photo… into a wind tunnel? |
+| 2 | 0:07 | 19 s | Cars, chips, turbines: all designed with physics simulations that take hours. AI can do it faster. The catch? It drifts, and it never tells you when. So we built Kolmo: a physics lab where the AI has to prove it's right. |
+| Card | 0:26 | 5 s | (no voice) |
+| 3 | 0:31 | 20 s | Here's the car from that photo. One word: car. Meta's SAM 3.1 cuts it out, right on this laptop. Kolmo sets it on the road, drops it into a real fluid solver, and one click later, the wake peels off the roof. |
+| 4 | 0:51 | 17 s | Want more? Just ask. Llama Prompt Guard checks the request, then the agent runs the whole study itself: data, training, testing. It fixes its own failures, and every number it reports is measured. |
+| 5 | 1:08 | 19 s | Which brings us to the real question: how long can you trust the AI? On patterns like these, our best model holds for a hundred and forty-five steps. On turbulence, it breaks in about twenty, and Kolmo shows you exactly where. |
+| 6 | 1:27 | 15 s | And it's not just air. 3D turbulence. Rising heat. Living patterns. Storms on a spinning planet. Type in an equation, and Kolmo builds the solver. |
+| 7 | 1:42 | 13 s | Every solver is checked against exact answers, and when the AI drifts, the real physics steps back in. |
+| 8 | 1:55 | 18 s | Fast answers are easy. Trustworthy ones aren't. Kolmo gives you both. Kolmo. Built on Meta AI. |
 
 ## Make it hit harder
 
