@@ -9,6 +9,7 @@ FakeProvider, which plans from fixed rules and explains only numbers it read fro
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
@@ -26,17 +27,36 @@ def load_env(path=ENV_PATH):
     return {**out, **{k: v for k, v in os.environ.items() if k in out or k.startswith(("KOLMO_", "GROQ_"))}}
 
 
+class RateLimited(RuntimeError):
+    def __init__(self, wait_s, msg):
+        super().__init__(msg)
+        self.wait_s = wait_s
+
+
 class OpenAIChatProvider:
     def __init__(self, base_url, model, key, timeout=120):
         self.url, self.model, self.key, self.timeout = base_url.rstrip("/") + "/chat/completions", model, key, timeout
         self.name = f"live · {model}"
 
     def chat(self, messages, tools):
-        body = {"model": self.model, "messages": messages, "tools": tools, "tool_choice": "auto", "temperature": 0}
+        body = {"model": self.model, "messages": messages, "temperature": 0}
+        if tools:  # "auto" + one call per turn: Groq gpt-oss is unreliable with "required" and parallel calls
+            body.update(tools=tools, tool_choice="auto", parallel_tool_calls=False)
+        if "gpt-oss" in self.model:
+            body["reasoning_effort"] = "medium"
         req = urllib.request.Request(self.url, json.dumps(body).encode(), method="POST",
-                                     headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            msg = json.load(r)["choices"][0]["message"]
+                                     headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
+                                              "User-Agent": "kolmo/0.1"})  # the API's firewall rejects urllib's default agent (HTTP 403)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                msg = json.load(r)["choices"][0]["message"]
+        except urllib.error.HTTPError as e:  # surface the provider's reason (e.g. terms not accepted, rate limit)
+            body = e.read().decode(errors="replace")
+            if e.code == 429:
+                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", body)
+                wait = (60 * int(m.group(1) or 0) + float(m.group(2))) if m else float(e.headers.get("retry-after") or 30)
+                raise RateLimited(wait, f"LLM provider HTTP 429: {body[:300]}") from None
+            raise RuntimeError(f"LLM provider HTTP {e.code}: {body[:400]}") from None
         calls = [{"id": c["id"], "name": c["function"]["name"], "arguments": json.loads(c["function"]["arguments"] or "{}")}
                  for c in msg.get("tool_calls") or []]
         return {"content": msg.get("content") or "", "tool_calls": calls}
@@ -51,99 +71,90 @@ def get_provider(env=None):
 
 
 # ----------------------------------------------------------------------------------------------- offline provider
-SYSTEM_WORDS = {"diffusion": ("diffusion", "heat", "temperature"),
-                "fluid2d": ("fluid", "kolmogorov", "vortic", "turbul", "navier", "flow")}
-NUM = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+SYSTEM_WORDS = {"diffusion": ("diffusion", "heat"), "fluid2d": ("fluid", "kolmogorov", "vortic", "turbul", "navier"),
+                "boussinesq": ("boussinesq", "convection", "rayleigh")}
+PDE_WORDS = {"cahn_hilliard": ("cahn", "phase separation"), "allen_cahn": ("allen",), "gray_scott": ("gray", "scott"),
+             "kuramoto_sivashinsky": ("kuramoto", "sivashinsky"), "swift_hohenberg": ("swift", "hohenberg"),
+             "burgers": ("burgers",)}
+KIND_WORDS = (("nca_hybrid", ("nca",)), ("fno", ("fno", "fourier")), ("latent", ("latent", "jepa")), ("cnn", ("cnn",)))
 
 
 def parse_question(q):
-    """Rule-based reading of a question -> (system or None, params, options)."""
+    """Rule-based reading of a task -> {"system", "pde" (bool), "kinds", "n", "minutes", "steps"}."""
     t = q.lower()
-    system = next((s for s, ws in SYSTEM_WORDS.items() if any(w in t for w in ws)), None)
-    params = {k: float(v) for k, v in re.findall(r"\b(kappa|nu|re|mu|dt|a|kf)\s*(?:=|of|is)\s*" + NUM, t)}
-    params = {("Re" if k == "re" else "A" if k == "a" else k): v for k, v in params.items()}
-    m = re.search(r"\b(?:n|grid)\s*(?:=|of|is)?\s*(\d+)", t)
-    if m:
-        params["n"] = int(m.group(1))
-    opts = {"kind": "fno" if "fno" in t or "fourier" in t else "cnn",
-            "compare": any(w in t for w in ("rollout", "unroll", "compare", "versus", " vs")),
-            "train_steps": int(m.group(1)) if (m := re.search(r"(\d+)\s*(?:training|train|optimi[sz]er)\s*steps", t)) else 200}
-    return system, params, opts
+    pde = next((s for s, ws in PDE_WORDS.items() if any(w in t for w in ws)), None)
+    system = pde or next((s for s, ws in SYSTEM_WORDS.items() if any(w in t for w in ws)), None)
+    num = lambda pat, d, f=float: f(m.group(1)) if (m := re.search(pat, t)) else d
+    return {"system": system, "pde": bool(pde), "kinds": [k for k, ws in KIND_WORDS if any(w in t for w in ws)] or ["cnn"],
+            "n": num(r"\b(?:n\s*=|grid(?: of)?)\s*(\d+)", None, int), "minutes": num(r"(\d+\.?\d*)\s*min", 1.0),
+            "steps": num(r"(\d+)\s*(?:time|rollout|trajectory)?\s*steps", 30, int)}
 
 
 class FakeProvider:
-    """Deterministic scripted 'model': list_systems -> validate_config -> estimate_cost -> run_experiment ->
-    read_results -> diagnose -> explanation. Asks for clarification when the question names no known system."""
+    """Deterministic scripted planner (no model, no network): plan -> list_systems -> compose_pde | describe_system ->
+    generate_data -> set_zen on -> train each kind -> set_zen off -> evaluate each -> compare -> make_figure ->
+    write_report -> answer. Stops and explains on the first failed tool; asks when no system is recognisable."""
     name = "offline · rule-based"
+    full_context = True  # it re-reads every tool result; no request-size limit offline
 
     def chat(self, messages, tools):
         q = next(m["content"] for m in messages if m["role"] == "user")
-        done = {}  # tool name -> last parsed result
-        names = {}
+        names, done = {}, []  # [(tool, result)] in order
         for m in messages:
             for c in m.get("tool_calls") or []:
                 names[c["id"]] = c["function"]["name"]
             if m["role"] == "tool":
-                done[names[m["tool_call_id"]]] = json.loads(m["content"])
-        system, params, o = parse_question(q)
-        call = lambda name, **a: {"content": "", "tool_calls": [{"id": f"c{len(names)}", "name": name, "arguments": a}]}
-        if "list_systems" not in done:
-            return call("list_systems")
-        if system is None:
-            return {"content": "Which system should I simulate? Known systems: " + ", ".join(done["list_systems"]) +
-                    ". Please name one (and any parameter values you care about).", "tool_calls": []}
-        cfg = self.config(q, system, params, o)
-        v = done.get("validate_config")
-        if v is None:
-            return call("validate_config", config=cfg)
-        if not v["ok"]:
-            return {"content": "The planned experiment is not valid: " + v["error"] +
-                    "\nPlease adjust the question (e.g. a smaller grid or fewer steps).", "tool_calls": []}
-        if "estimate_cost" not in done:
-            return call("estimate_cost", config=cfg)
-        r = done.get("run_experiment")
-        if r is None:
-            return call("run_experiment", config=cfg)
-        if "run_dir" not in r:
-            return {"content": r.get("error", "The run did not happen."), "tool_calls": []}
-        if "read_results" not in done:
-            return call("read_results", run_dir=r["run_dir"])
-        if "diagnose" not in done:
-            return call("diagnose", run_dir=r["run_dir"])
-        return {"content": self.explain(q, cfg, done), "tool_calls": []}
+                done.append((names[m["tool_call_id"]], json.loads(m["content"])))
+        if done and not done[-1][1].get("ok"):
+            return {"content": f"Stopped: {done[-1][0]} failed: {done[-1][1].get('error')}", "tool_calls": []}
+        got = {k: r for k, r in done}
+        a = parse_question(q)
+        sysname, kinds = a["system"], a["kinds"]
+        script = [("plan", {"steps": ["identify the system", "generate reference data", f"train {', '.join(kinds)}",
+                                      "evaluate long-horizon rollouts", "compare and diagnose", "figure and report"]}),
+                  ("list_systems", {})]
+        if sysname:
+            params = {"n": a["n"]} if a["n"] else {}
+            script += [("compose_pde", {"spec": sysname}) if a["pde"] else ("describe_system", {"name": sysname}),
+                       ("generate_data", {"system": sysname, "params": params, "steps": a["steps"], "n_train": 4,
+                                          "n_val": 1, "n_test": 2}),
+                       ("set_zen", {"on": True})]
+            ds = got.get("generate_data", {}).get("dataset", "d1")
+            script += [("train", {"dataset": ds, "kind": k, "budget_minutes": a["minutes"]}) for k in kinds]
+            script += [("set_zen", {"on": False})] + [("evaluate", {"model": k}) for k in kinds]
+            script += [("compare", {}), ("make_figure", {})]
+        if len(done) < len(script):
+            name, args = script[len(done)]
+            return {"content": "", "tool_calls": [{"id": f"c{len(done)}", "name": name, "arguments": args}]}
+        if not sysname:
+            return {"content": "Which system or PDE should I study? Registered: " + ", ".join(got["list_systems"]["systems"]) +
+                    "; PDE library: " + ", ".join(got["list_systems"].get("pde_library", {})) + ".", "tool_calls": []}
+        text = self.explain(q, kinds, done)
+        if "write_report" not in got:
+            return {"content": "", "tool_calls": [{"id": f"c{len(done)}", "name": "write_report",
+                                                   "arguments": {"markdown": text, "title": q[:80]}}]}
+        return {"content": text, "tool_calls": []}
 
     @staticmethod
-    def config(q, system, params, o):
-        n = params.get("n", 32)
-        p = {**params, "n": n}
-        model = {"kind": o["kind"], "width": 8, "depth": 2, **({"modes": min(8, n // 4)} if o["kind"] == "fno" else {})}
-        tc = {"model": model, "steps": o["train_steps"], "batch": 4, "eval_every": max(10, o["train_steps"] // 4),
-              "val_horizon": 10}
-        models = {"one_step": tc, **({"rollout": {**tc, "unroll": 3}} if o["compare"] else {})}
-        slug = re.sub(r"[^a-z0-9]+", "-", q.lower()).strip("-")[:32] or "question"
-        return {"name": f"assistant-{slug}", "data": {"system": system, "params": p, "steps": 20, "spacing": 2,
-                "train_seeds": [0, 1, 2, 3], "val_seeds": [100], "test_seeds": [200, 201]},
-                "models": models, "eval_steps": 20, "threshold": 0.5}
-
-    @staticmethod
-    def explain(q, cfg, done):
-        est, run, res, diag = done["estimate_cost"], done["run_experiment"], done["read_results"], done["diagnose"]
-        models = ", ".join(f"{k} ({v['model']['kind']}, unroll {v.get('unroll', 1)}, {v['steps']} training steps)"
-                           for k, v in cfg["models"].items())
-        d = cfg["data"]
-        rows = [f"- {r['model']} / {r['split']}: " + ", ".join(f"{k} {v}" for k, v in r.items() if k not in ("model", "split"))
-                for r in res["table"]]
-        rows += [f"- {m}: reference {t['reference_s_per_step']} s/step, surrogate {t['surrogate_s_per_step']} s/step, "
-                 f"speedup {t['speedup']}x" for m, t in res["runtime"].items()]
-        interp = [f"- [{f['level']}] {f['interpretation']}" for f in diag["findings"]] or ["- No rule fired."]
-        nxt = list(dict.fromkeys(f["next"] for f in diag["findings"] if f.get("next")))
-        return "\n".join([
-            "## Hypothesis", f"A learned surrogate of {d['system']} can reproduce the reference solver on held-out seeds "
-            f"for the horizon asked about (question: \"{q}\").", "",
-            "## Planned", f"- system {d['system']}, params {json.dumps(d['params'])}, {d['steps']} recorded steps "
-            f"(spacing {d['spacing']}), test seeds {d['test_seeds']}", f"- models: {models}",
-            f"- estimated cost {est['seconds']} s", "",
-            "## Ran", f"- run directory {run['run_dir']}, wall time {run['seconds']} s", "",
-            "## Measured", *rows, *[f"- {f['fact']}" for f in diag["findings"]], "",
-            "## Interpretation", *interp, "",
-            "## Open questions", *([f"- {x}" for x in nxt] or ["- None suggested by the rules."])])
+    def explain(q, kinds, done):
+        got = dict(done)
+        d, cmp_ = got["generate_data"], got["compare"]
+        trains = [r for k, r in done if k == "train"]
+        evals = {r["model"]: r for k, r in done if k == "evaluate"}
+        rec = [x for r in [d, *trains] for x in r.get("recovered", [])]
+        lines = ["## Hypothesis", f"Question: \"{q}\". Hypothesis: the models differ in how long their autoregressive "
+                 "rollouts stay within the failure threshold on held-out seeds.", "",
+                 "## Planned", f"- reference data {d['dataset']}: {d['system']}, train shape {d['shape_train']}, "
+                 f"{d['steps']} steps, dt {d['dt']}", f"- models: {', '.join(kinds)}", "",
+                 "## Ran", *[f"- {r['model']}: {r['optimizer_steps']} optimiser steps in {r['minutes']} min, "
+                             f"{r['weights']} weights, best val rollout relL2 {r['best_val_rollout_rel_l2']}" for r in trains],
+                 *[f"- recovery: {x}" for x in rec], "",
+                 "## Measured", *[f"- {m}: test relL2 by horizon {e['test']['rel_l2_at']}, median steps to failure "
+                                  f"{e['test']['steps_to_failure_median']} (failed {e['test']['failed']}), speedup "
+                                  f"{e['runtime']['speedup']}x" for m, e in evals.items()],
+                 *[f"- {f['model']}: {f['fact']}" for f in cmp_["findings"]], "",
+                 "## Interpretation", *([f"- [{f['level']}] {f['model']}: {f['interpretation']}" for f in cmp_["findings"]]
+                                        or ["- No diagnosis rule fired."]), "",
+                 "## Open questions", *([f"- {x}" for x in dict.fromkeys(f["next"] for f in cmp_["findings"] if f.get("next"))]
+                                        or ["- None suggested by the rules."])]
+        return "\n".join(lines)

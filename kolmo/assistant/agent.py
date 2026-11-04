@@ -1,23 +1,31 @@
-"""Research-assistant loop: question -> config -> validate -> (clarify) -> run -> read -> explain.
+"""Autonomous research loop: plan -> act (tool) -> observe -> adjust, until the model answers or a budget runs out.
 
-The provider plans through tool calls (kolmo.assistant.tools); the agent executes them, enforces confirmation of
-expensive runs, and audits the final explanation: every number in it must appear in a tool result or in the user's
-question, otherwise it is replaced by "[unverified]". The audited explanation is saved as <run dir>/assistant_report.md."""
+    run(question, on_event=cb) -> {"status", "text", "dir", "report", "removed", "events"}
+
+Events (docs/contracts.md): plan, status, tool, progress, result, zen, error, done. Budgets: tool calls and compute
+seconds per task (tools time themselves). Recovery (unstable dt, NaN training) happens inside the tools and is reported
+in their results; refusals (limits, invalid specs) come back as {"ok": false, "error"} so the model can adjust.
+Every number in the final answer and in write_report must appear in a tool result or the question; others become
+"[unverified]". The task directory runs/assistant/<time>-<slug>/ gets transcript.json and report.md."""
 import json
 import os
 import re
+import time
 
 from kolmo.assistant import tools
-from kolmo.assistant.provider import get_provider
+from kolmo.assistant.provider import RateLimited, get_provider
 
 SECTIONS = ("Hypothesis", "Planned", "Ran", "Measured", "Interpretation", "Open questions")
 SYSTEM = (
-    "You are Kolmo's research assistant. Turn the user's question into ONE small, valid Kolmo experiment and explain "
-    "its real results. Steps: list_systems; build an ExperimentConfig; validate_config (fix errors and retry); "
-    "estimate_cost; run_experiment; read_results; diagnose. If the system or the quantity of interest is unclear, "
-    "ask ONE clarifying question instead of calling tools. Keep runs small (grid <= 64, < 1000 training steps) unless "
-    "asked. Final answer: markdown with sections " + ", ".join(f"## {s}" for s in SECTIONS) + ". Use ONLY numbers that "
-    "appear in tool results; label interpretations as hypotheses; never invent measurements.")
+    "You are Kolmo's autonomous research assistant for physics world models. Work in a loop: first call plan(steps), "
+    "then act with ONE tool at a time, read the result, and adjust (call plan again if the plan changes). Typical task: "
+    "list_systems/describe_system or compose_pde -> generate_data -> train (cnn | fno | latent | nca_hybrid, with a "
+    "budget in minutes) -> evaluate -> compare -> make_figure -> write_report. Tools fix unstable dt and NaN training "
+    "themselves and tell you; if a tool returns ok=false, read the error and fix the arguments or explain why you stop. "
+    "Use set_zen(true) before long training and set_zen(false) after. Older tool results are shortened to their summary (the task keeps datasets, models and results by id): note key numbers as you go and call compare right before write_report. Stay inside the budgets given in each tool "
+    "result. Use ONLY numbers that appear in tool results; label interpretations as hypotheses. write_report and the "
+    "final answer use markdown sections " + ", ".join(f"## {s}" for s in SECTIONS) + ". If the question is unclear, "
+    "ask ONE clarifying question instead of calling tools.")
 NUMBER = re.compile(r"(?<![\w.^@/\\-])[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")  # "12x", "5s" count; "relL2", "fluid2d", hashes do not
 
 
@@ -42,7 +50,7 @@ def _supported(tok, allowed):
 
 def audit(text, sources):
     """Replace numbers not backed by `sources` (tool-result texts + question). Returns (text, removed tokens).
-    Numbered-list markers ("1. ") and heading levels are not numbers."""
+    Numbered-list markers ("1. ") are not numbers."""
     allowed = set().union(*map(_nums, sources)) if sources else set()
     removed = []
 
@@ -59,64 +67,122 @@ def audit(text, sources):
     return NUMBER.sub(sub, text), removed
 
 
+MAX_RATE_WAIT_S = 20 * 60  # total time a task may wait on provider rate limits
+KEEP_FULL = 3  # most recent tool results sent in full; older ones as their summary (full copies stay in the transcript)
+
+
+def compact(msgs):
+    """Bound the request size (Groq on-demand tier: 8000 tokens/min): old tool results shrink to ok/ids/summary.
+    The task memory keeps every dataset/model/result, so the model refers to them by id."""
+    idx = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+    out = list(msgs)
+    for i in idx[:-KEEP_FULL]:
+        r = json.loads(msgs[i]["content"])
+        keep = {k: r[k] for k in ("ok", "summary", "error", "dataset", "model", "system", "report", "figures") if k in r}
+        out[i] = {**msgs[i], "content": json.dumps(keep, default=str)}
+    return out
+
+
+def sections(text):
+    missing = [s for s in SECTIONS if not re.search(rf"^#+\s*{s}\b", text, re.M | re.I)]
+    return text + "".join(f"\n\n## {s}\n(not provided by the assistant)" for s in missing)
+
+
+def run(question, on_event=None, provider=None, out_dir="runs", max_calls=40, max_compute_s=25 * 60, should_stop=None):
+    provider = provider or get_provider()
+    events = []
+
+    def emit(ev):
+        events.append(ev)
+        if on_event:
+            on_event(ev)
+    slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:40] or "task"
+    task = tools.Task(os.path.join(out_dir, "assistant", f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}"), out_dir, emit,
+                      max_compute_s, should_stop)
+    task.sources.append(question)
+    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+    status, text, refused, malformed, waited = "error", "", 0, 0, 0.0
+    emit({"type": "status", "text": f"{provider.name}: budget {max_calls} tool calls, {max_compute_s / 60:.0f} min compute"})
+    while True:
+        if should_stop and should_stop():
+            text, status = "Cancelled by the user.", "cancelled"
+            emit({"type": "status", "text": text})
+            break
+        try:
+            reply = provider.chat(msgs if getattr(provider, "full_context", False) else compact(msgs), tools.SCHEMAS)
+        except RateLimited as e:  # honour the provider's stated wait, bounded per task
+            if e.wait_s > 120 or waited + e.wait_s > MAX_RATE_WAIT_S:
+                text = f"Provider error: {e}"
+                emit({"type": "error", "text": text})
+                break
+            waited += e.wait_s + 1
+            emit({"type": "status", "text": f"rate limited by the provider: waiting {e.wait_s + 1:.0f} s"})
+            time.sleep(e.wait_s + 1)
+            continue
+        except Exception as e:  # provider failure: report once, never retry-loop, never fabricate
+            if "tool_use_failed" in str(e) and malformed < 2:  # Groq: malformed call -> show the model its error once
+                malformed += 1
+                msgs.append({"role": "user", "content": f"Your last tool call was rejected by the API ({str(e)[:300]}). "
+                             "Call ONE tool with arguments that match its JSON schema exactly."})
+                continue
+            text = f"Provider error: {e}"
+            emit({"type": "error", "text": text})
+            break
+        calls = reply.get("tool_calls") or []
+        if not calls:
+            text = reply.get("content") or ""
+            status = "budget" if refused else "done" if task.calls else "clarify"
+            break
+        msgs.append({"role": "assistant", "content": reply.get("content") or "", "tool_calls": [
+            {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+            for c in calls]})
+        for c in calls:
+            if task.calls >= max_calls:
+                refused += 1
+                res = {"ok": False, "error": f"tool-call budget of {max_calls} exhausted: answer now with what you have"}
+                emit({"type": "tool", "name": c["name"], "args": c["arguments"], "ok": False, "summary": res["error"]})
+            else:
+                res = task.call(c["name"], c["arguments"])
+            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(res, default=str)})
+        if refused > 2:  # model ignored the budget message
+            text, status = "Stopped: tool-call budget exhausted.", "budget"
+            emit({"type": "error", "text": text})
+            break
+    text, removed = audit(text, task.sources)
+    if status in ("done", "budget") and task.datasets:
+        text = sections(text)
+        if removed:
+            text += f"\n\n> Audit: {len(removed)} number(s) not found in tool results were replaced by [unverified]."
+        if not task.report:
+            task.call("write_report", {"markdown": text})
+        emit({"type": "result", "metrics": task.metrics(), "figures": task.figures, "report": task.report})
+    os.makedirs(task.dir, exist_ok=True)
+    with open(os.path.join(task.dir, "transcript.json"), "w", encoding="utf-8") as f:
+        json.dump({"question": question, "provider": provider.name, "status": status, "messages": msgs,
+                   "events": events, "final": text}, f, indent=1, default=str)
+    emit({"type": "done"})
+    return {"status": status, "text": text, "dir": task.dir, "report": task.report, "removed": removed + task.removed,
+            "events": events}
+
+
 class Agent:
-    def __init__(self, provider=None, out_dir="runs", max_turns=16):
-        self.provider = provider or get_provider()
-        self.out_dir, self.max_turns = out_dir, max_turns
+    """Window-facing wrapper: .status for the badge, .run(question, on_event, should_stop) -> run() result."""
+    def __init__(self, provider=None, out_dir="runs", **budgets):
+        self.provider, self.out_dir, self.budgets = provider or get_provider(), out_dir, budgets
 
     @property
     def status(self):
         return self.provider.name
 
-    def ask(self, question, confirmed=False, log=print):
-        """-> {"status": "done" | "clarify" | "confirm" | "error", "text", "run_dir", "report", "removed", "trace"}.
-        status "confirm": the run needs the user's OK; call ask(question, confirmed=True) to proceed."""
-        msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
-        sources, trace, run_dir = [question], [], None
-        for _ in range(self.max_turns):
-            try:
-                reply = self.provider.chat(msgs, tools.SCHEMAS)
-            except Exception as e:  # network / provider failure: report, never fabricate
-                return self._out("error", f"Provider error: {type(e).__name__}: {e}", run_dir, trace)
-            calls = reply.get("tool_calls") or []
-            if not calls:
-                return self._finish(reply.get("content") or "", sources, run_dir, trace)
-            msgs.append({"role": "assistant", "content": reply.get("content") or "", "tool_calls": [
-                {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
-                for c in calls]})
-            for c in calls:
-                log(f"tool {c['name']}")
-                res = tools.call(c["name"], c["arguments"], self.out_dir, confirmed)
-                text = json.dumps(res, default=str)
-                sources.append(text)
-                trace.append({"tool": c["name"], "arguments": c["arguments"], "result": res})
-                msgs.append({"role": "tool", "tool_call_id": c["id"], "content": text})
-                if res.get("needs_confirmation") and c["name"] == "run_experiment":
-                    return self._out("confirm", f"This run is estimated at {res['estimated_seconds']} s (above "
-                                     f"{tools.LIMITS['confirm_seconds']} s). Run it?", run_dir, trace)
-                run_dir = res.get("run_dir", run_dir)
-        return self._out("error", f"Stopped after {self.max_turns} turns without a final answer.", run_dir, trace)
-
-    def _finish(self, text, sources, run_dir, trace):
-        if run_dir is None:  # no experiment ran: a clarification or a refusal, nothing to audit against results
-            text, removed = audit(text, sources)
-            return self._out("clarify", text, None, trace, removed)
-        missing = [s for s in SECTIONS if not re.search(rf"^#+\s*{s}\b", text, re.M | re.I)]
-        text += "".join(f"\n\n## {s}\n(not provided by the assistant)" for s in missing)
-        text, removed = audit(text, sources)
-        if removed:
-            text += f"\n\n> Audit: {len(removed)} number(s) not found in tool results were replaced by [unverified]."
-        report = os.path.join(run_dir, "assistant_report.md")
-        with open(report, "w", encoding="utf-8") as f:
-            f.write(f"# Assistant report\n\nProvider: {self.status}\n\n{text}\n")
-        return self._out("done", text, run_dir, trace, removed, report)
-
-    @staticmethod
-    def _out(status, text, run_dir, trace, removed=(), report=None):
-        return {"status": status, "text": text, "run_dir": run_dir, "report": report, "removed": list(removed), "trace": trace}
+    def run(self, question, on_event=None, should_stop=None):
+        return run(question, on_event, self.provider, self.out_dir, should_stop=should_stop, **self.budgets)
 
 
 if __name__ == "__main__":
     t, r = audit("1. error 0.0123 grew to 42 at step 10; R^2 0.98", ['{"e": 0.012345, "s": 10, "r2": 0.9811}'])
     assert r == ["42"] and "0.0123" in t and "0.98" in t and t.startswith("1. "), (t, r)
+    ms = [{"role": "tool", "tool_call_id": str(i), "content": json.dumps({"ok": True, "summary": "s", "big": [i] * 50})}
+          for i in range(5)]
+    c = compact(ms)
+    assert "big" not in c[0]["content"] and "big" in c[-1]["content"] and "big" in ms[0]["content"]
     print("ok")

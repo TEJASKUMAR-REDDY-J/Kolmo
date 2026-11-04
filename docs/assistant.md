@@ -1,60 +1,117 @@
-# Research assistant
+# Research assistant (autonomous)
 
-Turns a question ("how stable is a CNN surrogate of diffusion with kappa = 0.2 on a 16 grid?") into one small,
-validated Kolmo experiment, runs it, and explains the measured results.
+Give the assistant a physics world-model research task, for example "Build a lightweight NCA surrogate for
+Cahn-Hilliard phase separation, compare it with an FNO on long-horizon reliability, and write a report". It runs a
+loop until the task is done:
+
+1. **Plan.** The model calls `plan`.
+2. **Act.** It calls one tool per turn.
+3. **Observe.** The tool result comes back, with the budget used so far.
+4. **Adjust.** It calls `plan` again when the plan changes.
+
+The loop stops when the model answers or a budget runs out.
 
 | File | Role |
 |---|---|
-| `kolmo/assistant/provider.py` | `FakeProvider` (offline, deterministic, scripted from rules) and `OpenAIChatProvider` (OpenAI-compatible `/chat/completions` with tools, stdlib `urllib`). `get_provider()` reads `.env`. |
-| `kolmo/assistant/tools.py` | Tools over real code: `list_systems`, `validate_config`, `estimate_cost`, `run_experiment` (`kolmo.experiments.run`), `read_results`, `diagnose` (`kolmo.diagnose`). Limits and confirmation live here. |
-| `kolmo/assistant/agent.py` | Loop: list_systems, config, validate, (clarify), estimate, run, read, diagnose, explain. Audits numbers and writes `<run dir>/assistant_report.md`. |
-| `kolmo/app/assistant.py` | Panel logic: short commands (run, reset, explain, plan, train) use fixed rules; questions longer than 3 words go to the agent. |
+| `kolmo/assistant/agent.py` | `run(question, on_event, provider, out_dir, max_calls=40, max_compute_s=1500, should_stop)`. Also the loop, number audit, transcript, and the `Agent` wrapper used by the UI (`.status`, `.run`). |
+| `kolmo/assistant/tools.py` | `Task`: memory for one task (specs, datasets, models, results), budgets, events, argument checks. Also the tools. |
+| `kolmo/assistant/provider.py` | `OpenAIChatProvider` for any OpenAI-compatible `/chat/completions` endpoint (stdlib urllib), and the offline scripted `FakeProvider`. |
 
-## Provider selection (`.env`)
+## Tools
+
+- **Systems:** `list_systems`, `describe_system`.
+- **PDEs:** `compose_pde`. Pass a spec or a library name; it is validated by `kolmo.systems.make`, and errors come back so the model can fix the spec.
+- **Data:** `generate_data`.
+- **Training:** `train`. `kind` is `cnn`, `fno`, `latent` or `nca_hybrid`, and the time budget is in minutes.
+- **Evaluation:** `evaluate`, which rolls a model out over a long horizon on held-out seeds.
+- **Comparison:** `compare`, which builds a table and the `kolmo.diagnose` findings.
+- **Output:** `make_figure` and `write_report`.
+- **Model registry:** `registry_op`, with `list`, `register` or `remove`.
+- **UI:** `set_zen`.
+
+Each task writes to `runs/assistant/<time>-<slug>/`:
+
+- `checkpoints/`
+- `results.json`
+- figures (`*.png`)
+- `report.md`
+- `transcript.json`, which holds the messages and events
+
+The layout matches an experiment run, so `registry.register` works on it.
+
+## Reliability rules
+
+These are enforced in code, not left to the model.
+
+- **Only measured numbers.** Every number in `write_report` and in the final answer must appear in a tool result or in
+  the question. Any other number is replaced by `[unverified]`, and the replacements are counted.
+- **Argument checks.** Before a tool runs, its arguments are checked against the tool's schema. Unknown or missing
+  arguments come back as `ok: false`.
+- **Errors go back to the model.** A tool error is returned as a result, never raised, so the model can correct
+  itself or explain why it stops.
+- **Automatic recovery:**
+  - Unstable or non-finite reference data: dt is halved, up to 3 times.
+  - Non-finite training: one retry with lr divided by 3 and unroll set to 1.
+  - Malformed tool call (Groq returns `tool_use_failed`): the error is shown to the model, at most twice per task.
+- **Budgets:**
+  - 40 tool calls per task.
+  - 25 minutes of compute.
+  - At most 15 minutes of training per model.
+  - Grid n ≤ 128.
+  - At most 400 solver steps per trajectory.
+  - At most 64 trajectories.
+
+  Once a budget is used up, the tool results tell the model to wrap up.
+- **Provider errors stop the task.** An HTTP error is reported once, with the provider's reason, and never retried in
+  a loop.
+- **Cancel.** `should_stop()` is checked between turns and inside training.
+
+## Events (docs/contracts.md)
+
+| Event | Contents |
+|---|---|
+| `plan` | `steps` |
+| `status` | `text` |
+| `tool` | `name`, `args`, `ok`, `summary` |
+| `progress` | the training progress dict, plus `model` |
+| `result` | `metrics`, `figures`, `report` |
+| `zen` | `on` |
+| `error` | `text` |
+| `done` | |
+
+## Provider (`.env`)
 
 ```
 GROQ_API_KEY=...
 KOLMO_LLM_BASE_URL=https://api.groq.com/openai/v1
-KOLMO_LLM_MODEL=meta-models/muse-spark-open
-KOLMO_LLM_LIVE=0
+KOLMO_LLM_MODEL=openai/gpt-oss-120b
+KOLMO_LLM_LIVE=1
 ```
 
-The provider is live only when `KOLMO_LLM_LIVE=1` and `GROQ_API_KEY` is set. Otherwise the offline `FakeProvider`
-runs, so tests and development never use the network. The UI badge shows `offline · rule-based` or `live · <model>`.
-`meta-models/muse-spark-open` appears on Groq's models page as a Preview model (Enterprise, 131,072-token context).
-Groq's tool-use page lists it as supporting tool use. Preview models are meant for evaluation only and can be removed.
+The provider is live only when `KOLMO_LLM_LIVE=1` and the key is set. Otherwise the deterministic `FakeProvider` is
+used. It runs with no network and is what the tests use.
 
-## Guarantees
+Calls are sent with:
 
-- **Real numbers only.** Every number in the final explanation must appear in a tool result or in the question.
-  Numbers are matched at the precision they are displayed with, so `0.0854` matches `0.08542`. Any other number
-  is replaced by `[unverified]`, and the report says how many were replaced. List markers are not checked. Tokens
-  glued to identifiers are not checked either (`relL2`, `fluid2d`, run-directory hashes).
-- **Sections.** Hypothesis / Planned / Ran / Measured / Interpretation / Open questions. If a section is missing,
-  it is added and marked "(not provided by the assistant)".
-- **Clarification.** If the question names no known system, the agent asks which system to use and runs nothing.
-- **Limits** (`tools.LIMITS`): grid n <= 128, data steps x spacing <= 400, <= 5000 training steps per model,
-  <= 4 models. A run is refused when its estimate is above 1800 s. A run whose estimate is above 60 s waits for
-  the user to confirm. In the UI, reply `yes`. In code, call `Agent.ask(q, confirmed=True)`. The model cannot
-  confirm a run itself: the agent drops any `confirmed` or `out_dir` argument the model sends.
-- **Off the UI thread.** The window runs `Agent.ask` in a `Task` (QThread) and answers one question at a time.
+- `tool_choice="auto"`
+- `parallel_tool_calls=false`
+- `temperature=0`
+- `reasoning_effort="medium"` (gpt-oss models only)
 
-## Cost estimate
+Groq users report that gpt-oss tool calling fails more often with `tool_choice` set to `required`, with parallel
+calls, or with loose schemas. For that reason the schemas set `additionalProperties: false` at the top level.
 
-`seconds = 10 + 8 x models + trajectories x solver steps x n^2 x ref_rate + sum(steps x batch x unroll) x n^2 x 7e-6`
-
-The rates were measured on this machine, a shared 2-core CPU:
-
-- **Training:** `runs/ui-tiny-diffusion-v2`, 300 x 8 samples at 32^2 in 17.1 s, about 7e-6 s per cell-sample.
-- **Diffusion reference:** 1.36e-4 s/step at 32^2.
-- **fluid2d reference:** about 400 steps/s at 64^2 (`docs/physics.md`).
-
-Treat the result as an order of magnitude. The calibration used a CNN; FNO costs were not measured. In the test
-run (n = 16, 40 steps) the estimate was 18.3 s. The actual time was 6.0 s, measured on a second run that reused
-the cached data and checkpoints.
+Any OpenAI-compatible endpoint works. `meta-models/muse-spark-open` is listed on Groq as a Preview, Enterprise-only
+model with tool use. Once enterprise access exists, switch to it by changing `KOLMO_LLM_MODEL`.
 
 ## Tests
 
-`python -m pytest tests/test_assistant.py -q` runs offline with `FakeProvider`, about 80 s on the shared CPU.
-It covers parsing and provider selection, limits and confirmation, clarification, a full diffusion run with
-every section present and no number stripped, and a provider that invents a number (the number is stripped).
+`python -m pytest tests/test_assistant.py -q` runs offline with tiny grids. It covers:
+
+- question parsing and provider selection
+- clarification when no system is named
+- diffusion end to end (events, zen on/off, sections, report, transcript)
+- Cahn-Hilliard: compose the PDE, train `nca_hybrid` and `fno`, compare, then register a model
+- PDE spec errors returned to the model
+- the tool-call budget and number audit
+- dt-halving recovery

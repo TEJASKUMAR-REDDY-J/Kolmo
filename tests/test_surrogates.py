@@ -44,7 +44,8 @@ def test_data_splits_cache_and_stats(ds, tmp_path):
         small_cfg(heldout={"kappa": [0.2]}).validate()
 
 
-@pytest.mark.parametrize("arch", [{"kind": "cnn", "width": 8, "depth": 2}, {"kind": "fno", "width": 8, "modes": 4, "depth": 2, "pos": 2}])
+@pytest.mark.parametrize("arch", [{"kind": "cnn", "width": 8, "depth": 2}, {"kind": "fno", "width": 8, "modes": 4, "depth": 2, "pos": 2},
+                                  {"kind": "nca_hybrid", "hidden": 3, "width": 8, "modes": 4, "pos": 1}])
 def test_models_shapes_identity_init(arch):
     import jax
     net = models.build(arch)
@@ -183,3 +184,33 @@ def test_init_from_finetune(ds, tmp_path):
     sur2, _ = train.train(ds, ft, verbose=False)
     s = jnp.asarray(ds.splits["test"].states[0, 0]); p = ds.splits["test"].params[0]
     assert np.allclose(sur.stepper(p)(s), sur2.stepper(p)(s), atol=1e-5)  # lr ~ 0: weights kept
+
+
+def test_nca_hybrid_size_and_equivariance():
+    import jax
+    net = models.build({"kind": "nca_hybrid", "pos": 4})
+    z, c = jnp.zeros((1, 1, 64, 64)), jnp.zeros((1, 1))
+    n = sum(x.size for x in jax.tree_util.tree_leaves(net.init(jax.random.PRNGKey(0), z, c)))
+    assert n < 30_000, n
+    eq = models.build({"kind": "nca_hybrid", "hidden": 2, "width": 8, "modes": 4})
+    z = jax.random.normal(jax.random.PRNGKey(1), (1, 2, 16, 16))
+    p = jax.tree_util.tree_map(lambda w: w + 0.05, eq.init(jax.random.PRNGKey(0), z, jnp.zeros((1, 0))))
+    f = lambda x: eq.apply(p, x, jnp.zeros((1, 0)))
+    assert np.allclose(f(jnp.roll(z, (3, 5), (-2, -1))), jnp.roll(f(z), (3, 5), (-2, -1)), atol=1e-4)
+
+
+def test_fit_progress_cancel_and_registry(ds, tmp_path):
+    from kolmo.surrogates import registry
+    cfg = train.TrainConfig(model={"kind": "nca_hybrid", "hidden": 2, "width": 8, "modes": 4}, steps=500, batch=4,
+                            eval_every=100)
+    events = []
+    sur, hist = train.fit(ds, cfg, verbose=False, on_progress=events.append, should_stop=lambda: len(events) >= 3)
+    assert events[0]["phase"] == "data" and hist[-1]["stopped"] == "cancelled" and hist[-1]["step"] < 500
+    assert {"phase", "step", "total", "loss", "val_rollout_error", "eta_s"} <= set(events[-1])
+    run = tmp_path / "run1"
+    train.save(str(run / "checkpoints" / "m"), sur, ds, cfg, hist)
+    e = registry.register(str(run), root=str(tmp_path))
+    assert e["kind"] == "nca_hybrid" and e["params"] > 0 and registry.list("diffusion", root=str(tmp_path)) == [e]
+    assert registry.load(e["id"], root=str(tmp_path))[1]["arch"]["kind"] == "nca_hybrid"
+    registry.remove(e["id"], root=str(tmp_path))
+    assert registry.list(root=str(tmp_path)) == []
