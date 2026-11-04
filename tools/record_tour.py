@@ -128,14 +128,38 @@ def main(names):
     def nav(i):
         yield from click(win.nav.button(i))
 
-    def scenario(key, seconds, zen_at=None):
-        yield from nav(0)
-        yield 0.8
-        yield from click(win.scenario, lambda: win._run_scenario(win.scenario.findData(key)))
+    def scroll_sim(to=1.0, d=1.0):
+        """Smooth-scroll the Simulate page so the flow panels are in view."""
+        sa = win.pages.widget(0)
+        bar = sa.verticalScrollBar()
+        top = win.ref_view.mapTo(sa.widget(), QPoint(0, 0)).y() - 150  # the run card's header, just above the fields
+        a, b, n = bar.value(), max(0, min(bar.maximum(), top)), max(1, int(d * 30))
+        for k in range(n):
+            u = (k + 1) / n
+            bar.setValue(int(a + (b - a) * u * u * (3 - 2 * u)))
+            yield 1 / 30
+
+    def scenario(key, seconds, zen_at=None, warm=0.0, name=None):
+        if warm:  # develop the flow off camera, then roll
+            win._run_scenario(win.scenario.findData(key))
+            yield 1.0
+            yield from scroll_sim(d=0.1)
+            yield warm
+            rec.start(name)
+            yield 0.3
+        else:
+            rec.start(name)
+            yield from nav(0)
+            yield 0.8
+            yield from click(win.scenario, lambda: win._run_scenario(win.scenario.findData(key)))
+            yield from scroll_sim()
         t = time.perf_counter()
+        yield from move(at(win.ref_view, 0.7, 0.6), 1.2)
         if zen_at:
             yield zen_at
             yield from click(win.zen_btn)
+            yield 0.4
+            yield from scroll_sim(d=0.5)
         yield max(0.0, seconds - (time.perf_counter() - t))
         if win.zen:
             yield from click(win.zen_btn)
@@ -170,19 +194,22 @@ def main(names):
             yield from click(win.geo_ground)
             yield 1.0
             yield from click(win.geo_go)
-            yield 14.0
+            yield 0.6
+            yield from scroll_sim()
+            yield from move(at(win.ref_view, 0.75, 0.55), 1.2)
+            yield 12.0
             yield from click(win.zen_btn)
+            yield 0.4
+            yield from scroll_sim(d=0.5)
             yield 12.0
             yield from click(win.zen_btn)
             yield 1.0
             rec.stop()
             win.reset()
-        for key, name, secs in (("plume", "02_heated_plumes", 26), ("rt", "03_rayleigh_taylor", 18),
-                                ("cyclone", "04_cyclones", 16), ("gray_scott", "05_gray_scott", 16)):
+        for key, name, secs, warm in (("plume", "02_heated_plumes", 24, 75), ("rt", "03_rayleigh_taylor", 20, 30),
+                                      ("cyclone", "04_cyclones", 18, 8), ("gray_scott", "05_gray_scott", 18, 40)):
             if key in names:
-                rec.start(name)
-                yield 0.5
-                yield from scenario(key, secs, zen_at=secs * 0.45)
+                yield from scenario(key, secs, zen_at=secs * 0.4, warm=warm, name=name)
                 rec.stop()
         if "experiments" in names:
             rec.start("06_experiments")
@@ -216,7 +243,10 @@ def main(names):
                     lst.setCurrentRow(i)
                     yield 1.4
             yield from click(win.mdl_run)
-            yield 20.0
+            yield 0.6
+            yield from scroll_sim()
+            yield from move(at(win.err_view, 0.5, 0.5), 1.4)
+            yield 18.0
             rec.stop()
             win.reset()
         if "assistant" in names:
