@@ -1,85 +1,79 @@
-# Kolmo: 3-minute demo video
+# Kolmo: demo video (2:40)
 
-Target: 3:00. About 400 words of voiceover, read at a calm pace (about 140 words a minute). Each block lists the
-time, what is on screen, and the line to read. Clips marked `clip:` are in `video/clips/` (1920×1080, 60 fps,
-no text, made by `python tools/render_clips.py`). Shots marked `screen:` are recordings of the app (see the
-recording notes at the end).
+**Project settings:** 1920×1080 (16:9), 60 fps timeline. Export H.264 (High profile) at 25–40 Mbps, AAC audio at
+320 kbps.
+- The simulation clips (`video/clips/`) are 1080p60.
+- The dashboard shots (`video/tour/`) are 1080p30. Drop them straight onto the 60 fps timeline: each frame shows
+  twice, and that is fine for UI footage.
 
-Rubric mapping: impact (30 %) → 0:12–0:32 and 2:38–3:00; Meta AI tooling (25 %) → 0:00–0:12, 0:32–1:02 and the
-Prompt Guard beat at 1:05; technical depth (20 %) → 1:30–2:38; demo (25 %) → everything on `screen:`.
-
----
-
-### 0:00–0:12 · Hook
-- clip: `car_reveal.mp4`. A photo, Meta SAM 3.1's mask sweeping over it, the background falling away, the car
-  gliding into the tunnel, the wind switching on.
-- **VO:** "This is a photo of a car. Ten seconds later, it's sitting in a wind tunnel, and nobody wrote any CAD."
-
-### 0:12–0:32 · The problem
-- clip: `car_tunnel.mp4` (wake shedding behind the car), then `heat_plume.mp4`.
-- **VO:** "Simulating physics, like air over a car or heat rising off a chip, takes experts and hours of compute.
-  AI models can predict it far faster, but nobody can tell you when that prediction quietly stops being
-  true. Kolmo is a lab that does both. It runs the real physics, trains small AI models to imitate it, and measures
-  exactly how long you can trust them."
-
-### 0:32–1:02 · Meta SAM 3.1: photo to wind tunnel (live)
-- screen: the Photo wind tunnel page. Drop `car_side.png` and type "car". Press **Find it with SAM 3.1** (cut the
-  wait), and the glowing mask appears. Show the tunnel preview, toggle **Road under it**, press **Run wind tunnel**.
-  The app switches to Simulate and the wake starts shedding behind the real photo of the car.
-- **VO:** "Drop in any photo and say what it is. Meta's Segment Anything 3.1 runs locally on this laptop and cuts
-  the object out from a single word. Kolmo levels it, scales it, sets it on the road, and turns it into a solid
-  obstacle for a real Navier–Stokes solver. One click, and the air flows left to right around your object."
-
-### 1:02–1:30 · The autonomous research assistant
-- screen: the assistant panel. Type: *"Build a lightweight NCA surrogate for Gray-Scott spot patterns, compare it
-  with an FNO over 200 steps, and tell me which one keeps the spots stable."* Show the "Llama Prompt Guard 2: injection
-  risk 0.00" status line. The plan steps tick off, **Zen mode** fades in, and the live training-loss chart runs. Speed
-  this up 8–16× in the edit.
-- **VO:** "Or just ask. Every request is screened by Meta's Llama Prompt Guard first. Then the assistant plans the
-  study, generates data with the solver, trains the models, tests them on runs it has never seen, and writes the
-  report. It doesn't invent results: any number it can't trace back to a measurement is flagged."
-
-### 1:30–2:00 · How long can you trust the AI?
-- clip: `ai_vs_truth.mp4` (solver | neural surrogate | difference, side by side). Then screen: the Experiments page
-  with the leaderboard boxes, and the Models page.
-- **VO:** "Here's the honest part. On the left is the exact physics; in the middle, a 23-thousand-weight neural
-  cellular automaton. On Gray-Scott patterns it stays accurate for about 145 steps, with errors near three tenths
-  of a percent. On turbulence, every model breaks within about twenty steps, and Kolmo shows you that instead of
-  hiding it."
-
-### 2:00–2:22 · Range of physics (montage, 3–4 s per clip, cut on the beat)
-- clip: `rings3d.mp4` (4–5 s: two vortex rings collide in 3D and break apart) → `heat_rt.mp4` → `cyclone.mp4` →
-  `gray_scott.mp4` → `cahn_hilliard.mp4`. End on screen: the **Try a scenario…** menu opening.
-- **VO:** "Full 3D turbulence: two vortex rings colliding. Heat and buoyancy. Cyclones drifting on a rotating
-  planet. Chemical patterns that copy themselves. Alloys separating. Type an equation and Kolmo builds the solver
-  for it."
-
-### 2:22–2:38 · Engineering depth
-- screen: Simulate running in Zen mode (press Z), with the error-vs-horizon chart and hybrid mode re-anchoring.
-- **VO:** "Under the hood there are spectral solvers in JAX, each checked against exact solutions; three neural
-  architectures; and a hybrid mode where the solver steps in whenever the AI drifts. All of it runs offline on a
-  laptop CPU."
-
-### 2:38–3:00 · Impact and close
-- clip: `car_tunnel.mp4` again (slow push-in in the edit). Fade to the Kolmo logo.
-- **VO:** "Engineers, students and researchers get fast simulation, plus a measured answer to the question that
-  matters: when does it stop being right? Kolmo. Built on Meta AI."
+**Voice:** paste the "Voiceover for text-to-speech" section into your TTS tool. It is about 330 words, which reads in
+about 2:30 at a natural pace, leaving roughly 10 s for music-only moments. `<break time="…"/>` tags are ElevenLabs
+pauses; delete them if your tool doesn't support them.
 
 ---
 
-## Recording the app (`screen:` shots)
-- Use OBS Studio: 1920×1080, 60 fps, recording format MKV (remux to MP4 afterwards), encoder x264 at CRF 16, or the
-  hardware encoder at "Indistinguishable" quality. Capture the Kolmo window only.
-- Before recording, maximise the window, turn on **Animated background** (⚙ menu), close other apps, and set Windows
-  display scaling to 100 % so the text is crisp.
-- Warm up first: run SAM 3.1 once (the model loads in about 1 minute), so the take shows the ~10 s re-prompt rather
-  than the cold start. Cut the wait in the edit anyway.
-- In Simulate, use **Speed 4×** for smooth, fast flow.
-- Assistant takes are long. Record the whole run and speed it up in the edit. Keep the moment where the plan steps
-  turn green at real speed.
+## Scene plan
 
-## Edit notes
-- Use 0.3–0.5 s cross-dissolves between clips and hard cuts on the music beats.
-- For text overlays, use one sans-serif font (Inter or SF Pro), white at 85 %, lower-left, three words at most, for
-  example "Meta SAM 3.1 · local" or "145 steps · 0.3 % error".
-- Mix the music around −18 LUFS under the voice and duck it 6 dB while the VO is speaking.
+| # | Time | Length | Picture | Voiceover |
+|---|---|---|---|---|
+| 1 | 0:00–0:08 | 8 s | `clips/car_reveal.mp4`: photo, SAM mask sweep, cut-out, glide, wind on | "One photo. One word. A wind tunnel." |
+| 2 | 0:08–0:22 | 14 s | `clips/car_tunnel.mp4` (6 s), then `clips/heat_plume.mp4` (8 s, from 2 s in) | the problem |
+| 3 | 0:22–0:50 | 28 s | `tour/01_photo_wind_tunnel.mp4`: type "car", Find it with SAM 3.1, glow mask, Run wind tunnel, Zen. Speed up the SAM wait 4×. | Meta SAM 3.1 |
+| 4 | 0:50–1:14 | 24 s | `tour/08_assistant_autonomous.mp4`: typing the task, plan ticking, Zen fading in, training curve (already a time-lapse) | autonomous assistant + Llama Prompt Guard |
+| 5 | 1:14–1:38 | 24 s | `tour/07_models_ai_vs_solver.mp4` (10 s) → `clips/ai_vs_truth.mp4` (6 s) → `tour/06_experiments.mp4` leaderboard (8 s) | how long can you trust the AI |
+| 6 | 1:38–2:00 | 22 s | Montage, 3–4 s each, cut on the beat: `clips/rings3d.mp4` → `tour/02_heated_plumes.mp4` → `clips/heat_rt.mp4` → `tour/04_cyclones.mp4` → `clips/gray_scott.mp4` → `clips/cahn_hilliard.mp4` (from 7 s) | range of physics |
+| 7 | 2:00–2:18 | 18 s | `clips/rings3d.mp4` (slow, 8 s) → `tour/03_rayleigh_taylor.mp4` in Zen (10 s) | engineering depth |
+| 8 | 2:18–2:40 | 22 s | `clips/car_tunnel.mp4` with a slow push-in (1.0 → 1.15 scale), fade to the Kolmo logo at 2:34, then black | impact and close |
+
+Music: build up through 1–2, settle under 3–5, peak into the 6 montage (hit the cuts), drop out for 2–3 s at the start
+of 7, then resolve under 8.
+
+On-screen text (optional, lower-left, one font, at most 4 words):
+- Scene 3: "Meta SAM 3.1 · on-device"
+- Scene 4: "Llama Prompt Guard 2"
+- Scene 5: "145 steps · 0.3 % error"
+- Scene 6: "3D Navier–Stokes · 96³"
+- Scene 8: "Kolmo"
+
+---
+
+## Voiceover for text-to-speech
+
+One photo. One word. A wind tunnel. <break time="1.2s" />
+
+Simulating physics, like air over a car or heat rising off a chip, still takes experts and hours of compute. AI can
+predict it far faster, but nobody tells you when that prediction quietly stops being true. <break time="0.6s" /> Kolmo
+does. <break time="1.0s" />
+
+Drop in any photo and say what it is. Meta's Segment Anything 3.1 runs right here on the laptop and finds the object
+from a single word. Kolmo levels it, sets it on the road, and turns it into a solid body for a real Navier–Stokes
+solver. <break time="0.4s" /> One click, and the air flows. <break time="1.2s" />
+
+Or just ask. Every request is first screened by Meta's Llama Prompt Guard. Then the assistant plans the study, runs
+the solver, trains the models, tests them on cases they have never seen, and writes the report itself. Any number it
+can't trace back to a measurement gets flagged. <break time="1.0s" />
+
+And this is the part most AI tools skip. Left: the exact physics. Middle: a tiny neural network. On these chemical
+patterns it stays accurate for a hundred and forty-five steps, at three tenths of a percent error. On turbulence,
+every model breaks within about twenty, and Kolmo shows you exactly where. <break time="1.0s" />
+
+Full 3D vortex rings. <break time="0.3s" /> Rising heat. <break time="0.3s" /> Storms on a spinning planet.
+<break time="0.3s" /> Patterns that copy themselves. <break time="0.3s" /> Type an equation, and Kolmo builds the
+solver. <break time="1.2s" />
+
+Under the hood: spectral solvers in JAX, each checked against exact answers, neural models that learn the physics,
+and a hybrid mode where the real solver steps in the moment the AI drifts. The physics and the models run offline, on one laptop CPU.
+<break time="1.2s" />
+
+For engineers, students and researchers: simulation that's fast, plus an honest answer to the question that matters
+most. <break time="0.5s" /> When does it stop being right? <break time="1.0s" />
+
+Kolmo. <break time="0.4s" /> Built on Meta AI.
+
+---
+
+## Tips
+- Cut on the music's downbeats in scene 6; use 0.3–0.5 s cross-dissolves everywhere else.
+- In scene 3, speed-ramp the SAM wait (8 s → 2 s) and land back at real speed when the glowing mask appears.
+- Grade lightly: a little contrast and a slight teal-in-shadows tint. The clips are already on black.
+- Regenerate the footage: `python tools/render_clips.py`, `python tools/render_3d.py`, `python tools/record_tour.py`.

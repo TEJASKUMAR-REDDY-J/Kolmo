@@ -1154,7 +1154,7 @@ class MainWindow(QMainWindow):
                 txt, col = self._verdict(ttf)
                 vals = (f"<b>{html.escape(str(r['model']))}</b>", fmt(r.get("relL2@1")) if r.get("relL2@1") is not None else "–",
                         fmt(r.get("relL2@10")) if r.get("relL2@10") is not None else "–",
-                        f"{ttf:g} steps" if isinstance(ttf, (int, float)) else "–",
+                        f"{ttf:g} step{'' if ttf == 1 else 's'}" if isinstance(ttf, (int, float)) else "–",
                         f"{sp:.2f}×" if isinstance(sp, (int, float)) else "–")
                 for j, t in enumerate(vals):
                     g.addWidget(label(t), i, j)
