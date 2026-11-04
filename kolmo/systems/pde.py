@@ -225,7 +225,8 @@ class PDE:
     # ------------------------------------------------------------------ System protocol
     def initial(self, params, seed):
         """ic: one string for all fields or {field: string}; '+'-joined terms const:c | noise:A (white, 2/3 band,
-        std A, seeded) | bump:A:r (Gaussian, centre of box) | sin:A:m (A sin(2 pi m x / L)) | zero."""
+        std A, seeded) | bump:A:r (Gaussian, centre of box) | sin:A:m (A sin(2 pi m x / L)) |
+        spots:A:r:count (Gaussian bumps at seeded random positions, the same for every field) | zero."""
         p = params if params.get("_skip") else self.validate(params)
         n, L = int(p["n"]), float(p["L"])
         x = np.arange(n) * L / n
@@ -250,10 +251,14 @@ class PDE:
                         u += a[0] * np.exp(-((X - L / 2) ** 2 + (Y - L / 2) ** 2) / (2 * a[1] ** 2))
                     elif kind == "sin":
                         u += a[0] * np.sin(2 * np.pi * a[1] * X / L)
+                    elif kind == "spots":  # spots:A:r:count, Gaussian bumps at seeded positions shared by all fields
+                        for cx, cy in np.random.default_rng([seed, 7]).uniform(0, L, (int(a[2]), 2)):
+                            dx, dy = (X - cx + L / 2) % L - L / 2, (Y - cy + L / 2) % L - L / 2
+                            u += a[0] * np.exp(-(dx ** 2 + dy ** 2) / (2 * a[1] ** 2))
                     else:
                         raise ValueError
                 except (ValueError, IndexError):
-                    raise ValueError(f"bad ic term {term!r} for field {f}; use const:c, noise:A, bump:A:r, sin:A:m, zero") from None
+                    raise ValueError(f"bad ic term {term!r} for field {f}; use const:c, noise:A, bump:A:r, sin:A:m, spots:A:r:count, zero") from None
             out.append(u)
         return jnp.asarray(np.stack(out), jnp.float32)
 

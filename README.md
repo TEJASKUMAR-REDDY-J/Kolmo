@@ -5,8 +5,8 @@
 Kolmo takes a photo of an object and segments it with Meta's **SAM 3.1**, then simulates the flow around it with an
 exact numerical solver. It trains neural surrogates (CNN, FNO and a **JEPA-style latent world model**) to predict that
 flow far faster, and measures exactly when and why those predictions stop being trustworthy. A hybrid mode lets the
-solver step in. A research assistant (a Meta model on Groq, offline by default) turns questions into experiments and
-explains *measured* results. Everything runs on a laptop CPU.
+solver step in. An autonomous research assistant (an LLM via Groq, screened by Meta's **Llama Prompt Guard 2**;
+offline by default) turns questions into experiments and explains *measured* results. Everything runs on a laptop CPU.
 
 ![Kolmo](docs/images/ui_hybrid.png)
 
@@ -52,7 +52,7 @@ Full tables and definitions: [docs/evaluation.md](docs/evaluation.md),
 |---|---|---|
 | **SAM 3.1** (Segment Anything 3.1) | photo → object mask → obstacle in the flow | locally on CPU, no API calls ([docs/geometry.md](docs/geometry.md)) |
 | **JEPA** (Joint-Embedding Predictive Architecture, the I-JEPA objective) | architecture of the latent world model, trained on our own simulations | locally, JAX ([docs/latent-world-model.md](docs/latent-world-model.md)) |
-| **Muse Spark** (`meta-models/muse-spark-open` on Groq) | research assistant: question → validated experiment → explanation of measured numbers | Groq API, only when you enable it ([docs/assistant.md](docs/assistant.md)) |
+| **Llama Prompt Guard 2** (86M, on Groq) | screens every task given to the research assistant for prompt injection / jailbreaks before any tool runs (risk > 0.9 is refused) | Groq API, only when the live assistant is enabled ([docs/assistant.md](docs/assistant.md)) |
 | SAM 3D Objects | photo → 3D shape (study on making it run on light hardware) | in progress ([docs/sam3d-lightweight.md](docs/sam3d-lightweight.md)) |
 
 ## Run it
@@ -70,7 +70,11 @@ Reproduce the long-horizon experiment (writes `runs/<name>-<hash>/` with config,
 python -m kolmo.experiments run benchmarks/long_horizon.json
 ```
 
-Turn a photo into an obstacle (falls back to OpenCV GrabCut without SAM weights):
+In the app, **Photo wind tunnel** (left menu): drop a photo, type what it is, and SAM 3.1 cuts it out. Kolmo levels
+it, sets it on a road, and runs the flow past it from left to right. **Try a scenario…** (top bar) loads one-click
+demos: car wind tunnel, heated plume, Rayleigh–Taylor, β-plane cyclones, Gray–Scott, Cahn–Hilliard.
+
+From the command line (falls back to OpenCV GrabCut without SAM weights):
 ```bash
 python -m kolmo.geometry photo.jpg --prompt "car" --n 128
 ```
@@ -81,7 +85,10 @@ python -m pytest tests -q
 ```
 
 The assistant works offline. To use the hosted model, copy `.env.example` to `.env`, then set `GROQ_API_KEY` and
-`KOLMO_LLM_LIVE=1`.
+`KOLMO_LLM_LIVE=1`. Extra keys (`GROQ_API_KEY_2`, `GROQ_API_KEY_3`, …) are used in turn, and a key that hits its
+rate limit is skipped until it recovers.
+
+Demo-video clips (1080p60, made from the solvers): `python tools/render_clips.py`, written to `video/clips/`.
 
 ## How it is built
 
@@ -122,5 +129,5 @@ Solver verification ([docs/physics.md](docs/physics.md)): 8 tests pass.
 ## Licences of third-party models
 
 SAM 3.1 / SAM 3D are used under Meta's SAM License: a copy is kept next to downloaded weights, and use is
-acknowledged here. Muse Spark is used through Groq under Groq's and Meta's terms. Weights are not redistributed in
+acknowledged here. Llama Prompt Guard 2 is used through Groq under the Llama license and Groq's terms. Weights are not redistributed in
 this repository.

@@ -26,7 +26,7 @@ def test_parse_and_offline_by_default():
     assert a["system"] == "cahn_hilliard" and a["pde"] and a["kinds"] == ["nca_hybrid", "fno"] and a["n"] == 16
     assert a["minutes"] == 0.5
     assert get_provider({"KOLMO_LLM_LIVE": "1"}).name == "offline · rule-based"  # no key -> offline
-    assert get_provider({"KOLMO_LLM_LIVE": "1", "GROQ_API_KEY": "x", "KOLMO_LLM_MODEL": "m"}).name == "live · m"
+    assert get_provider({"KOLMO_LLM_LIVE": "1", "GROQ_API_KEY": "x", "KOLMO_LLM_MODEL": "m"}).name == "live"  # model id never shown
 
 
 def test_clarify_when_no_system(runs):
@@ -91,3 +91,29 @@ def test_recovery_halves_dt(runs, monkeypatch):
     t = tools.Task(os.path.join(runs, "rec"), runs, lambda e: None, 120)
     r = t.call("generate_data", {"system": "diffusion", "params": {"n": 16}, "steps": 6, "n_train": 2, "n_val": 1, "n_test": 1})
     assert r["ok"] and r["recovered"] and dts[1] == pytest.approx(0.025), (r, dts)
+
+
+def test_key_rotation_and_cooldown():
+    """Round-robin over keys; a 429 cools only that key; RateLimited only when every key cools."""
+    import io
+    import urllib.error
+    from kolmo.assistant.provider import OpenAIChatProvider, RateLimited
+    p = OpenAIChatProvider("http://x", "m", ["a", "b"])
+    used, limited = [], {"a"}
+
+    def post(body, j):
+        used.append(p.keys[j])
+        if p.keys[j] in limited:
+            raise urllib.error.HTTPError("u", 429, "rl", {}, io.BytesIO(b"Please try again in 7.5s"))
+        return {"content": "ok"}
+    p._post = post
+    assert p.chat([], [])["content"] == "ok" and used == ["a", "b"]
+    assert p.chat([], [])["content"] == "ok" and used[-1] == "b"  # "a" still cooling: skipped, not retried
+    limited.add("b")
+    p.cool[1] = 0.0
+    try:
+        p.chat([], [])
+        raise AssertionError("expected RateLimited")
+    except RateLimited as e:
+        assert 0 < e.wait_s <= 8.5
+    assert p.name == "live"

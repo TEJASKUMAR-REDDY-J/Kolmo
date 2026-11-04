@@ -15,6 +15,7 @@ import time
 from kolmo.assistant import tools
 from kolmo.assistant.provider import RateLimited, get_provider
 
+GUARD_BLOCK = 0.9  # Prompt Guard probability above which a task is refused
 SECTIONS = ("Hypothesis", "Planned", "Ran", "Measured", "Interpretation", "Open questions")
 SYSTEM = (
     "You are Kolmo's autonomous research assistant for physics world models. Work in a loop: first call plan(steps), "
@@ -103,7 +104,14 @@ def run(question, on_event=None, provider=None, out_dir="runs", max_calls=40, ma
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
     status, text, refused, malformed, waited = "error", "", 0, 0, 0.0
     emit({"type": "status", "text": f"{provider.name}: budget {max_calls} tool calls, {max_compute_s / 60:.0f} min compute"})
-    while True:
+    risk = provider.guard(question) if hasattr(provider, "guard") else None
+    if risk is not None:  # Meta Llama Prompt Guard 2 screens the task before any tool can run
+        emit({"type": "status", "text": f"Llama Prompt Guard 2: injection risk {risk:.2f}"})
+    if risk is not None and risk > GUARD_BLOCK:
+        text, status = (f"Blocked by Llama Prompt Guard 2 (prompt-injection risk {risk:.2f}). Rephrase the task as a "
+                        "plain research request."), "blocked"
+        emit({"type": "error", "text": text})
+    while status != "blocked":
         if should_stop and should_stop():
             text, status = "Cancelled by the user.", "cancelled"
             emit({"type": "status", "text": text})
@@ -116,7 +124,7 @@ def run(question, on_event=None, provider=None, out_dir="runs", max_calls=40, ma
                 emit({"type": "error", "text": text})
                 break
             waited += e.wait_s + 1
-            emit({"type": "status", "text": f"rate limited by the provider: waiting {e.wait_s + 1:.0f} s"})
+            emit({"type": "status", "text": f"all API keys rate limited: waiting {e.wait_s + 1:.0f} s"})
             time.sleep(e.wait_s + 1)
             continue
         except Exception as e:  # provider failure: report once, never retry-loop, never fabricate

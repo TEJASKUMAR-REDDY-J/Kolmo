@@ -29,7 +29,8 @@ from kolmo.app.widgets import (ACCENT, ACCENT2, CAND, COMPARE, DIVERGING, EVENT,
                                MetricCard, card, fmt, heading, mask_image, sci)
 
 MODES = (("reference", "Reference"), ("surrogate", "Surrogate"), ("hybrid", "Hybrid"))
-OBSTACLES = (("none", "None"), ("circle", "Circle"), ("square", "Square"), ("photo", "From photo…"))
+OBSTACLES = (("none", "None"), ("circle", "Circle"), ("square", "Square"), ("photo", "From photo…"),
+             ("tunnel", "Photo wind tunnel"))
 NAV = (("simulate", "◈", "Simulate"), ("experiments", "⚗", "Experiments"), ("assistant", "✦", "Assistant"),
        ("models", "⬡", "Models"), ("geometry", "◐", "Geometry"), ("reports", "▤", "Reports"))
 AUTO = "auto"
@@ -197,6 +198,75 @@ class Task(QThread):
             self.err.emit(traceback.format_exc(limit=3))
 
 
+def _disc(n, x, y, r):
+    yy, xx = (np.mgrid[0:n, 0:n] + 0.5) / n
+    return (xx - x) ** 2 + (yy - y) ** 2 <= r * r
+
+
+# one-click demos: (label, system, params (incl. ones without a widget, e.g. ic / mask), steps, stride, field)
+SCENARIOS = {
+    "plume": ("Heated plume (buoyant convection)", "boussinesq",
+              lambda: {"n": 256, "Ra": 2e7, "Pr": 1.0, "ic": "zero", "T_body": 1.0, "mask": _disc(256, 0.5, 0.12, 0.06)},
+              4000, 8, "temperature"),
+    "rt": ("Rayleigh–Taylor mushrooms (heavy over light)", "boussinesq",
+           lambda: {"n": 256, "Ra": 1e7, "Pr": 1.0, "ic": "rayleigh_taylor", "ic_m": 3, "ic_eps": 0.05, "ic_delta": 0.05},
+           2500, 4, "temperature"),
+    "cyclone": ("Cyclones on a β-plane (drift north-west)", "fluid2d",
+                lambda: {"n": 256, "nu": 3e-4, "beta": 2.5, "ic": "vortices",
+                         "vortices": [(3.9, 2.5, 0.55, 7.0), (1.75, 3.9, 0.4, -5.0), (2.6, 1.4, 0.3, 5.0)]},
+                3000, 4, "vorticity"),
+    "gray_scott": ("Gray–Scott self-replicating spots", "gray_scott",
+                   lambda: {"n": 192, "L": 0.96, "F": 0.0367, "k": 0.0649, "dt": 1.0,
+                           "ic": {"u": "const:1+spots:-0.5:0.03:10+noise:0.01", "v": "spots:0.25:0.03:10"}},
+                   2500, 16, "v"),
+    "cahn": ("Cahn–Hilliard phase separation", "cahn_hilliard", lambda: {"n": 256, "L": 128.0, "dt": 0.03}, 2500, 4, "u"),
+}
+
+
+class PhotoView(QLabel):
+    """Photo panel: drop an image file on it; a click on the photo reports (x, y) in photo pixels."""
+    dropped, clicked = Signal(str), Signal(float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(420, 340)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet(f"background: rgba(0,0,0,0.30); border: 1px dashed rgba(255,255,255,0.22); "
+                           f"border-radius: 16px; color: {MUTED}; font-size: 15px;")
+        self.setText("Drop a photo here\n\nside views work best: a car, a plane, a wing, a mug…")
+        self.rgb, self.scale, self.off = None, 1.0, (0.0, 0.0)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self.dropped.emit(e.mimeData().urls()[0].toLocalFile())
+
+    def show_rgb(self, rgb):
+        self.rgb = np.ascontiguousarray(rgb)
+        h, w = rgb.shape[:2]
+        self.scale = min((self.width() - 20) / w, (self.height() - 20) / h)
+        self.off = ((self.width() - w * self.scale) / 2, (self.height() - h * self.scale) / 2)
+        qi = QImage(self.rgb.data, w, h, self.rgb.strides[0], QImage.Format_RGB888).copy()
+        self.setPixmap(QPixmap.fromImage(qi).scaled(int(w * self.scale), int(h * self.scale), Qt.KeepAspectRatio,
+                                                    Qt.SmoothTransformation))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.rgb is not None:
+            self.show_rgb(self.rgb)
+
+    def mousePressEvent(self, e):
+        if self.rgb is None:
+            return
+        x, y = (e.position().x() - self.off[0]) / self.scale, (e.position().y() - self.off[1]) / self.scale
+        if 0 <= x < self.rgb.shape[1] and 0 <= y < self.rgb.shape[0]:
+            self.clicked.emit(x, y)
+
+
 class Runner(QThread):
     """Iterates a backend.LiveRun; sends frames in batches at most ~30 times a second so drawing never limits stepping."""
     started_run = Signal(object)
@@ -293,8 +363,11 @@ def scroller(widget):
 
 
 class MainWindow(QMainWindow):
+    geo_progress = Signal(str)  # SAM 3.1 progress, emitted from a worker thread
+
     def __init__(self):
         super().__init__()
+        self.tunnel, self.extra = None, {}  # extra: scenario params without a widget, for one system
         self.setWindowTitle("Kolmo · Physics-AI Research Platform")
         self.resize(1680, 1000)
         self.setStyleSheet(QSS + arrow_rule())
@@ -325,6 +398,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._build_experiments())
         self.pages.addWidget(self._build_models())
         self.pages.addWidget(self._build_geometry())
+        self.geo_progress.connect(lambda m: self.geo_status.setText(m))
         self.pages.addWidget(self._build_reports())
         body.addWidget(self.pages, 1)
         body.addWidget(self._build_side())
@@ -349,6 +423,16 @@ class MainWindow(QMainWindow):
         top.addWidget(Logo())
         top.addLayout(brand)
         top.addStretch(1)
+        self.scenario = QComboBox()
+        self.scenario.addItem("▶  Try a scenario…", None)
+        self.scenario.addItem("Car in a wind tunnel (photo + SAM 3.1)", "car")
+        for key, sc in SCENARIOS.items():
+            self.scenario.addItem(sc[0], key)
+        self.scenario.setToolTip("Load a ready-made demo and run it")
+        self.scenario.setStyleSheet("font-size: 14px; padding: 7px 14px; border-radius: 12px;")
+        self.scenario.setMaximumWidth(340)
+        self.scenario.activated.connect(self._run_scenario)
+        top.addWidget(self.scenario)
         self.system = QComboBox()
         self.system.setMinimumWidth(210)
         self.system.setToolTip("Physical system")
@@ -625,6 +709,11 @@ class MainWindow(QMainWindow):
         self.steps.setValue(400)
         self.steps.setToolTip("Surrogate steps (1 step = the checkpoint's spacing in solver steps; 1 in reference mode)")
         r.addLayout(row(label("Steps"), None, self.steps))
+        self.stride = QComboBox()
+        for k in (1, 2, 4, 8, 16):
+            self.stride.addItem(f"{k}×", k)
+        self.stride.setToolTip("Solver steps per shown frame (reference mode): higher plays long rollouts faster")
+        r.addLayout(row(label("Speed"), None, self.stride))
         self.run_btn = button("Run", "primary", "Run (Space)", self.run)
         r.addWidget(self.run_btn)
         self.run_error = label("", "error", wrap=True)
@@ -978,33 +1067,101 @@ class MainWindow(QMainWindow):
         return c, v
 
     def _build_experiments(self):
-        c, v = self._page("Experiments", "Experiment runs written by  python -m kolmo.experiments run <config.json>  "
-                                         "(runs/<name>-<hash>/). Numbers are read from their results.json.")
-        self.exp_view = QTextBrowser()
-        v.addWidget(self.exp_view, 1)
+        c, v = self._page("Experiments", "Every study Kolmo has run, scored on held-out test trajectories: how long each "
+                                         "model's rollout stays within the failure threshold, its error and its speed.")
+        self.exp_lead = QHBoxLayout()
+        self.exp_lead.setSpacing(12)
+        v.addLayout(self.exp_lead)
+        self.exp_box = QVBoxLayout()
+        self.exp_box.setSpacing(14)
+        inner = QWidget()
+        inner.setObjectName("page")
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 4, 8, 4)
+        lay.addLayout(self.exp_box)
+        lay.addStretch(1)
+        v.addWidget(scroller(inner), 1)
         return c
 
+    @staticmethod
+    def _verdict(ttf):
+        """(text, colour) for steps to failure."""
+        if not isinstance(ttf, (int, float)) or ttf != ttf:
+            return "not measured", MUTED
+        if ttf >= 50:
+            return "stable", OK
+        if ttf >= 10:
+            return "short range", ACCENT2
+        return "fails early", FAIL
+
+    @staticmethod
+    def _chip(text, colour):
+        lab = QLabel(text)
+        lab.setStyleSheet(f"color: {colour}; background: rgba(255,255,255,0.06); border: 1px solid {colour}55; "
+                          "border-radius: 10px; padding: 2px 10px; font-size: 11px; font-weight: 600;")
+        return lab
+
     def _fill_experiments(self):
+        for lay in (self.exp_box, self.exp_lead):
+            while lay.count():
+                it = lay.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
         exps = backend.experiments()
         if not exps:
-            self.exp_view.setHtml(f"<p style='color:{MUTED}'>No experiment runs yet. Run one with "
-                                  "<code>python -m kolmo.experiments run &lt;config.json&gt;</code>.</p>")
+            self.exp_box.addWidget(label("No experiment runs yet: ask the assistant, or run "
+                                         "python -m kolmo.experiments run <config.json>.", "muted", wrap=True))
             return
-        out = []
+        best = []
         for e in exps:
-            rows = e["rows"]
-            keys = [k for k in (rows[0] if rows else {}) if k not in ("model",)]
-            head = "".join(f"<th style='padding:3px 10px; color:{MUTED}; text-align:left'>{html.escape(k)}</th>" for k in keys)
-            body = "".join("<tr><td style='padding:3px 10px'><b>" + html.escape(str(r["model"])) + "</b></td>" +
-                           "".join(f"<td style='padding:3px 10px'>{html.escape(fmt(r[k]) if isinstance(r[k], float) else str(r[k]))}</td>"
-                                   for k in keys) + "</tr>" for r in rows)
-            rt = "; ".join(f"{m}: speed-up {fmt(x['speedup'])}× ({fmt(1e3 * x['reference_s_per_step'])} vs "
-                           f"{fmt(1e3 * x['surrogate_s_per_step'])} ms/step)" for m, x in e["runtime"].items() if x.get("speedup"))
-            out.append(f"<h3 style='margin-bottom:2px'>{html.escape(e['name'])}</h3>"
-                       f"<div style='color:{FAINT}'>{html.escape(e['dir'])} · {e['n_findings']} rule-based findings</div>"
-                       f"<table style='margin-top:6px'><tr><th style='padding:3px 10px; color:{MUTED}; text-align:left'>model</th>"
-                       f"{head}</tr>{body}</table><div style='color:{MUTED}; margin-top:4px'>{html.escape(rt)}</div>")
-        self.exp_view.setHtml("".join(out))
+            for r in e["rows"]:
+                if r.get("split") == "test" and isinstance(r.get("ttf_median"), (int, float)):
+                    best.append((r["ttf_median"], r["model"], e["title"]))
+        for rank, (ttf, model, title) in enumerate(sorted(best, key=lambda x: -x[0])[:4]):
+            bc, bv = card((16, 12, 16, 12), spacing=2, radius=14, level=1)
+            bv.addWidget(label(["BEST", "2ND", "3RD", "4TH"][rank], "section"))
+            num = QLabel(f"{ttf:g}")
+            num.setStyleSheet(f"font-size: 28px; font-weight: 700; color: {self._verdict(ttf)[1]};")
+            bv.addWidget(num)
+            bv.addWidget(label("steps before failure", "note"))
+            who = label(f"<b>{html.escape(model)}</b> · {html.escape(title)}", "muted", wrap=True)
+            who.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            bv.addWidget(who)
+            self.exp_lead.addWidget(bc, 1)
+        cols = ("Model", "Error @1", "Error @10", "Stays accurate", "Speed", "Verdict")
+        for e in exps:
+            ec, ev = card((18, 14, 18, 14), spacing=8, radius=16, level=1)
+            report = e.get("report")
+            title = heading(e["title"], 14)
+            title.setWordWrap(True)
+            title.setMinimumWidth(10)
+            title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            hdr = [title, self._chip(f"{e['n_findings']} findings", MUTED)]
+            if report:
+                hdr.append(button("Open report", "chip", "Open the run report", lambda _=False, r=report: self._open_report(r)))
+            ev.addLayout(row(*hdr, stretch_first=True))
+            g = QGridLayout()
+            g.setHorizontalSpacing(18)
+            g.setVerticalSpacing(6)
+            for j, h_ in enumerate(cols):
+                g.addWidget(label(h_.upper(), "section"), 0, j)
+            rows = [r for r in e["rows"] if r.get("split") == "test"] or e["rows"]
+            rows = sorted(rows, key=lambda r: -(r.get("ttf_median") or 0))
+            for i, r in enumerate(rows, 1):
+                rt = e["runtime"].get(r["model"], {})
+                sp = rt.get("speedup")
+                ttf = r.get("ttf_median")
+                txt, col = self._verdict(ttf)
+                vals = (f"<b>{html.escape(str(r['model']))}</b>", fmt(r.get("relL2@1")) if r.get("relL2@1") is not None else "–",
+                        fmt(r.get("relL2@10")) if r.get("relL2@10") is not None else "–",
+                        f"{ttf:g} steps" if isinstance(ttf, (int, float)) else "–",
+                        f"{sp:.2f}×" if isinstance(sp, (int, float)) else "–")
+                for j, t in enumerate(vals):
+                    g.addWidget(label(t), i, j)
+                g.addWidget(self._chip(txt, col), i, len(vals), Qt.AlignLeft)
+            g.setColumnStretch(0, 2)
+            ev.addLayout(g)
+            self.exp_box.addWidget(ec)
 
     def _build_models(self):
         c, v = self._page("Models", "Trained surrogates: the model registry (runs/registry.json) plus checkpoints on disk "
@@ -1015,7 +1172,10 @@ class MainWindow(QMainWindow):
             if s_ is not None:
                 self.mdl_filter.addItem(lbl, s_.name)
         self.mdl_filter.currentIndexChanged.connect(lambda _: self._fill_models())
-        v.addLayout(row(label("System"), self.mdl_filter, None))
+        self.mdl_hide = QCheckBox("Hide models that fail early (< 10 steps)")
+        self.mdl_hide.setChecked(True)
+        self.mdl_hide.toggled.connect(lambda _: self._fill_models())
+        v.addLayout(row(label("System"), self.mdl_filter, 16, self.mdl_hide, None))
         h = QHBoxLayout()
         h.setSpacing(18)
         self.mdl_list = QListWidget()
@@ -1064,13 +1224,18 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             self._models = []
             self.mdl_info.setHtml(self._html_note(f"Cannot read the registry: {e}"))
+        ttf = lambda e: (e.get("metrics") or {}).get("steps_to_failure")
+        if self.mdl_hide.isChecked():
+            self._models = [e for e in self._models if not (isinstance(ttf(e), (int, float)) and ttf(e) < 10)]
+        self._models.sort(key=lambda e: -(ttf(e) if isinstance(ttf(e), (int, float)) else -1))
         self.mdl_list.clear()
         for e in self._models:
-            m = e.get("metrics") or {}
-            one = m.get("one_step")
+            t = ttf(e)
+            verdict, colour = self._verdict(t)
             it = QListWidgetItem(f"{e['name']}   ·   {e['kind']}   ·   {e['system']}"
-                                 + (f"   ·   1-step error {fmt(one)}" if isinstance(one, (int, float)) else "")
+                                 + (f"   ·   accurate for {t:g} steps ({verdict})" if isinstance(t, (int, float)) else "")
                                  + ("" if e.get("registered", True) else "   ·   not registered"))
+            it.setForeground(QColor(colour))
             it.setToolTip(str(e.get("path")))
             self.mdl_list.addItem(it)
         if self._models:
@@ -1173,31 +1338,267 @@ class MainWindow(QMainWindow):
             return
         self._fill_models()
 
+    # ------------------------------------------------------------ geometry: photo -> Meta SAM 3.1 -> wind tunnel
     def _build_geometry(self):
-        c, v = self._page("Geometry", "Photo → object mask (SAM 3 when installed, else OpenCV GrabCut) → obstacle grid "
-                                      "for Fluid 2D. The mask becomes the Simulate obstacle.")
-        self.geo_preview = QLabel()
-        self.geo_preview.setFixedSize(320, 320)
-        self.geo_preview.setStyleSheet("background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.15); "
-                                       "border-radius: 14px;")
-        self.geo_preview.setAlignment(Qt.AlignCenter)
-        self.geo_note = label("No photo yet.", "muted", wrap=True)
-        v.addLayout(row(button("Choose photo…", "primary", slot=self._geo_pick), None))
-        h = row(self.geo_preview, self.geo_note, spacing=18)
-        h.setStretch(1, 1)
-        v.addLayout(h)
-        v.addStretch(1)
+        c, v = self._page("Photo wind tunnel", "Drop a photo, say what the object is: Meta SAM 3.1 (running locally) cuts "
+                                               "it out, Kolmo levels it, scales it and puts it in a virtual wind tunnel "
+                                               "with the flow from left to right.")
+        self.geo = {"path": None, "rgb": None, "mask": None, "point": None}
+        self.photo_view = PhotoView()
+        self.photo_view.dropped.connect(self._geo_load)
+        self.photo_view.clicked.connect(self._geo_click)
+        side = QVBoxLayout()
+        side.setSpacing(10)
+        self.geo_text = QLineEdit()
+        self.geo_text.setPlaceholderText("What is it?  e.g. car, airplane, wing, mug")
+        self.geo_text.returnPressed.connect(self._geo_segment)
+        self.geo_seg = button("Find it with SAM 3.1", "primary", "Segment the object named above (or click it in the photo)",
+                              self._geo_segment)
+        self.geo_status = label("Drop a photo or choose one.", "muted", wrap=True)
+        self.tunnel_view = QLabel()
+        self.tunnel_view.setFixedSize(340, 200)
+        self.tunnel_view.setAlignment(Qt.AlignCenter)
+        self.tunnel_view.setStyleSheet("background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.12); "
+                                       "border-radius: 12px;")
+        self.geo_size = QDoubleSpinBox()
+        self.geo_size.setRange(0.12, 0.5)
+        self.geo_size.setSingleStep(0.02)
+        self.geo_size.setValue(0.32)
+        self.geo_size.setToolTip("Object length as a fraction of the tunnel")
+        self.geo_flip = QCheckBox("Flip (front faces right)")
+        self.geo_ground = QCheckBox("Road under it")
+        self.geo_ground.setChecked(True)
+        self.geo_res = QComboBox()
+        for n in (192, 256, 384):
+            self.geo_res.addItem(f"{n}²", n)
+        self.geo_res.setCurrentIndex(1)
+        self.geo_wind = QDoubleSpinBox()
+        self.geo_wind.setRange(0.25, 3.0)
+        self.geo_wind.setSingleStep(0.25)
+        self.geo_wind.setValue(1.0)
+        for w in (self.geo_size, self.geo_flip, self.geo_ground, self.geo_res):
+            (w.toggled if isinstance(w, QCheckBox) else w.valueChanged if isinstance(w, QDoubleSpinBox)
+             else w.currentIndexChanged).connect(lambda *_: self._geo_preview())
+        self.geo_go = button("Run wind tunnel  ▶", "primary", "Open Simulate and run the flow past this object", self._tunnel_run)
+        self.geo_go.setEnabled(False)
+        side.addWidget(label("OBJECT", "section"))
+        side.addWidget(self.geo_text)
+        side.addLayout(row(button("Choose photo…", slot=self._geo_choose), self.geo_seg))
+        side.addWidget(self.geo_status)
+        side.addWidget(label("TUNNEL", "section"))
+        side.addWidget(self.tunnel_view)
+        side.addLayout(row(label("Size"), self.geo_size, label("Wind"), self.geo_wind, None))
+        side.addLayout(row(self.geo_ground, self.geo_flip, None))
+        side.addLayout(row(label("Grid"), self.geo_res, None, self.geo_go))
+        side.addStretch(1)
+        h = QHBoxLayout()
+        h.setSpacing(18)
+        h.addWidget(self.photo_view, 3)
+        h.addLayout(side, 2)
+        v.addLayout(h, 1)
+        sample = Path(__file__).resolve().parents[2] / "data" / "samples" / "car_side.png"
+        if sample.exists():
+            QTimer.singleShot(0, lambda: self._geo_load(str(sample)))
         return c
 
-    def _geo_pick(self):
-        s = next((s for _, s, _ in self._systems if s is not None and backend.supports_obstacle(s)), None)
-        if s is None:
-            self.geo_note.setText("No system with obstacles is available.")
+    def _geo_choose(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Photo of an object", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if path:
+            self._geo_load(path)
+
+    def _geo_load(self, path):
+        import cv2
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            self.geo_status.setText(f"Cannot read {Path(path).name} as an image.")
             return
-        if not backend.supports_obstacle(self.current_system()):
-            self.system.setCurrentIndex(next(i for i, (_, x, _) in enumerate(self._systems) if x is s))
-        self.obstacle.setCurrentIndex(3)
-        self._on_obstacle()
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        s = 1400 / max(rgb.shape[:2])
+        if s < 1:
+            rgb = cv2.resize(rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        self.geo.update(path=path, rgb=rgb, mask=None, point=None)
+        cached = Path(path).with_name(Path(path).stem + "_mask.npy")
+        if cached.exists():  # a mask SAM made earlier for this photo
+            m = np.load(cached)
+            if m.shape == rgb.shape[:2]:
+                self.geo["mask"] = m
+        self.geo_go.setEnabled(self.geo["mask"] is not None)
+        self.photo_view.show_rgb(self._geo_overlay())
+        self.geo_status.setText(f"{Path(path).name}: type what it is, then Find it." if self.geo["mask"] is None else
+                                f"{Path(path).name}: segmented earlier by SAM 3.1. Adjust and run, or Find it again.")
+        if not self.geo_text.text() and "car" in Path(path).stem.lower():
+            self.geo_text.setText("car")
+        self._geo_preview()
+
+    def _geo_click(self, x, y):
+        if self.geo["rgb"] is not None:
+            self.geo["point"] = (x, y)
+            self._geo_segment()
+
+    def _geo_overlay(self):
+        import cv2
+        img, m = self.geo["rgb"].copy(), self.geo["mask"]
+        if m is not None:
+            img[m] = (0.6 * img[m] + 0.4 * np.array([70, 150, 255])).astype(np.uint8)
+            edge = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)).astype(np.float32)
+            glow = np.clip(cv2.GaussianBlur(edge, (0, 0), 4) * 2.5 + edge, 0, 1)[..., None]
+            img = (img * (1 - glow) + glow * np.array([255, 225, 110])).astype(np.uint8)
+        if self.geo["point"] is not None:
+            cv2.circle(img, tuple(int(v) for v in self.geo["point"]), 7, (60, 255, 140), -1, cv2.LINE_AA)
+        return img
+
+    def _geo_segment(self):
+        if self.geo["rgb"] is None:
+            self.geo_status.setText("Choose or drop a photo first.")
+            return
+        text = self.geo_text.text().strip() or None
+        prompt = {"text": text, "point": self.geo["point"]} if (text or self.geo["point"]) else None
+        rgb = self.geo["rgb"]
+
+        def work():
+            from kolmo.geometry import photo_dialog as pd
+            from kolmo.geometry.segment import get_segmenter
+            if pd._SEGMENTER is None:
+                pd._SEGMENTER = get_segmenter("auto")
+            seg = pd._SEGMENTER
+            if hasattr(seg, "progress"):
+                seg.progress = self.geo_progress.emit
+            t0 = time.perf_counter()
+            mask = seg.segment(rgb, prompt)
+            return mask, seg.name, time.perf_counter() - t0, getattr(seg, "last_info", {}).get("score")
+
+        task = Task(work)
+        task.ok.connect(self._geo_done)
+        task.err.connect(lambda m: (self.geo_status.setText(f"Segmentation failed: {m}"), self.geo_seg.setEnabled(True)))
+        self._keep(task)
+        self.geo_seg.setEnabled(False)
+        self.geo_status.setText("Running Meta SAM 3.1 on this computer… (the first run loads the model, about a minute)")
+        task.start()
+
+    def _geo_done(self, res):
+        mask, name, secs, score = res
+        self.geo_seg.setEnabled(True)
+        if not np.asarray(mask).any():
+            self.geo_status.setText("Nothing found: try another word, or click on the object.")
+            return
+        self.geo["mask"] = np.asarray(mask, bool)
+        if self.geo["path"]:
+            try:
+                np.save(Path(self.geo["path"]).with_name(Path(self.geo["path"]).stem + "_mask.npy"), self.geo["mask"])
+            except OSError:
+                pass
+        self.photo_view.show_rgb(self._geo_overlay())
+        who = "Meta SAM 3.1" if name == "sam3" else "GrabCut (SAM 3.1 not installed)"
+        conf = f", confidence {score:.2f}" if isinstance(score, (int, float)) else ""
+        self.geo_status.setText(f"{who}: found it in {secs:.1f} s{conf}. Re-prompt with text or a click to refine.")
+        self.geo_go.setEnabled(True)
+        self._geo_preview()
+
+    def _tunnel(self, n=None):
+        from kolmo.geometry.mask import tunnel_grid
+        n = n or self.geo_res.currentData()
+        return tunnel_grid(self.geo["mask"], n=n, chord=self.geo_size.value(), x=0.16,
+                           ground=0.3 if self.geo_ground.isChecked() else None, ground_cells=max(2, n // 80),
+                           flip=self.geo_flip.isChecked())
+
+    def _tunnel_sprite(self):
+        """Photo cut-out (RGBA QImage, oriented like the grid) for drawing over the obstacle cells."""
+        from kolmo.geometry.mask import orient
+        m = self.geo["mask"]
+        x0, y0, x1, y1 = orient(m)[2]
+        rgba = np.dstack([self.geo["rgb"][y0:y1, x0:x1], (m[y0:y1, x0:x1] * 255).astype(np.uint8)])
+        if self.geo_flip.isChecked():
+            rgba = rgba[:, ::-1]
+        rgba = np.ascontiguousarray(rgba)
+        return QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], QImage.Format_RGBA8888).copy()
+
+    def _geo_preview(self):
+        if self.geo.get("mask") is None:
+            self.tunnel_view.setText("The tunnel preview appears here")
+            return
+        try:
+            grid, meta = self._tunnel(160)
+        except ValueError as e:
+            self.tunnel_view.setText(str(e))
+            return
+        img = np.full(grid.shape + (3,), (6, 8, 22), np.uint8)
+        img[grid] = (70, 74, 92)
+        qi = QImage(np.ascontiguousarray(img[::-1]).data, 160, 160, 480, QImage.Format_RGB888).copy()
+        W_, H_ = self.tunnel_view.width() - 8, self.tunnel_view.height() - 8
+        pm = QPixmap(W_, H_)
+        pm.fill(QColor(6, 8, 22))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r0 = 0.22 if self.geo_ground.isChecked() else 0.5 - 0.5 * H_ / W_  # show a 16:9-ish band around the object
+        src = QRectF(0, (1 - r0 - H_ / W_) * 160, 160, H_ / W_ * 160)
+        p.drawImage(QRectF(0, 0, W_, H_), qi, src)
+        c0, rr, w, h = meta["box"]
+        sx = W_ / 160
+        top = (160 - (rr + h)) * sx - src.top() * sx
+        p.drawImage(QRectF(c0 * sx, top, w * sx, h * sx), self._tunnel_sprite())
+        p.setPen(QPen(QColor(120, 190, 255, 160), 2))
+        for k in range(4):  # wind arrows
+            y = H_ * (0.18 + 0.12 * k)
+            p.drawLine(QPointF(8, y), QPointF(30, y))
+            p.drawLine(QPointF(30, y), QPointF(24, y - 4))
+            p.drawLine(QPointF(30, y), QPointF(24, y + 4))
+        p.end()
+        self.tunnel_view.setPixmap(pm)
+
+    def _run_scenario(self, i):
+        key = self.scenario.itemData(i)
+        self.scenario.setCurrentIndex(0)
+        if key is None:
+            return
+        if key == "car":
+            self.nav.button(4).setChecked(True)
+            self._on_nav(4)
+            if self.geo.get("mask") is not None:
+                self._tunnel_run()
+            return
+        label_, name, make_params, steps, stride, field = SCENARIOS[key]
+        if self.runner is not None:
+            self.reset()
+        idx = next((j for j, (_, s, _) in enumerate(self._systems) if s is not None and s.name == name), None)
+        if idx is None:
+            return
+        self.system.setCurrentIndex(idx)
+        self._on_system()
+        params = make_params()
+        cfg = self.config()
+        cfg["params"].update({k: v for k, v in params.items() if k in self.param_widgets})
+        cfg.update(mode="reference", steps=steps, stride=stride, obstacle={"kind": "none"})
+        self.apply_config(cfg)
+        self.extra = {"_system": name, **{k: v for k, v in params.items() if k not in self.param_widgets}}
+        if field in self.current_system().fields:
+            self.field_sel.setCurrentIndex(list(self.current_system().fields).index(field))
+        self.nav.button(0).setChecked(True)
+        self._on_nav(0)
+        self.run()
+
+    def _tunnel_run(self):
+        if self.geo.get("mask") is None:
+            return
+        n = self.geo_res.currentData()
+        try:
+            grid, meta = self._tunnel(n)
+        except ValueError as e:
+            self.geo_status.setText(str(e))
+            return
+        if self.runner is not None:
+            self.reset()
+        self.tunnel = {"grid": grid, "meta": meta, "sprite": self._tunnel_sprite()}
+        idx = next(i for i, (_, s, _) in enumerate(self._systems) if s is not None and s.name == "fluid2d")
+        self.system.setCurrentIndex(idx)
+        self._on_system()
+        cfg = self.config()
+        U = self.geo_wind.value()
+        cfg["params"].update(n=n, U_inf=U, nu=0.4 * U / n, Re=None, sponge=0.08, beta=0.0, A=0.0, mu=0.0)
+        cfg.update(mode="reference", steps=6000, stride=4, obstacle={"kind": "tunnel", "size": self.geo_size.value()})
+        self.apply_config(cfg)
+        self.nav.button(0).setChecked(True)
+        self._on_nav(0)
+        self.run()
 
     def _build_reports(self):
         c, v = self._page("Reports", "report.md files written by kolmo.experiments.")
@@ -1241,6 +1642,8 @@ class MainWindow(QMainWindow):
 
     def _on_system(self):
         s = self.current_system()
+        if self.extra.get("_system") != s.name:
+            self.extra = {}
         while self.params_grid.count():
             w = self.params_grid.takeAt(0).widget()
             if w:
@@ -1330,6 +1733,11 @@ class MainWindow(QMainWindow):
         return OBSTACLES[self.obstacle.currentIndex()][0]
 
     def _on_obstacle(self):
+        if self._obstacle_kind() == "tunnel" and self.tunnel is None:
+            self.obstacle.setCurrentIndex(0)
+            self.nav.button(4).setChecked(True)
+            self._on_nav(4)
+            return
         if self._obstacle_kind() == "photo":
             from kolmo.geometry.photo_dialog import ask  # SAM 3.1 text/click prompts, cached embedding, live preview
             res = ask(self, int(self._params().get("n") or 128), self.obstacle_size.value())
@@ -1376,6 +1784,8 @@ class MainWindow(QMainWindow):
             return None
         if kind == "photo":
             return self.photo["mask"] if self.photo else None
+        if kind == "tunnel":
+            return self.tunnel["grid"] if self.tunnel else None
         return backend.builtin_obstacle(kind, int(self._params().get("n") or 64), self.obstacle_size.value())
 
     def _update_thumb(self):
@@ -1437,6 +1847,8 @@ class MainWindow(QMainWindow):
     def _on_mode(self):
         m = self.mode()
         self.exec_box.setVisible(m != "reference")
+        self.stride.setEnabled(m == "reference")
+        self.cand_view.setVisible(m != "reference")
         self.policy_box.setVisible(m == "hybrid")
         note, miss = self._ckpt_status() if m != "reference" else ("", [])
         self.ckpt_note.setText(note + (f"\n! outside training: {', '.join(miss)}" if miss else ""))
@@ -1462,11 +1874,17 @@ class MainWindow(QMainWindow):
         obst = {"kind": kind, "size": self.obstacle_size.value()}
         if kind == "photo" and self.photo:
             obst["path"] = self.photo["path"]
+        params = self._params()
+        if self.extra.get("_system") == self.current_system().name:
+            params.update({k: v for k, v in self.extra.items() if k != "_system"})
+        if kind == "tunnel" and self.tunnel:
+            obst["grid"] = self.tunnel["grid"]
+            params["ic"] = "zero"  # the wind starts from rest
         policy = {"every": self.pol_every.value(), "residual_tol": self.pol_res.value() or None,
                   "energy_tol": self.pol_energy.value() or None}
-        return {"system": self.current_system().name, "params": self._params(), "seed": self.seed.value(),
+        return {"system": self.current_system().name, "params": params, "seed": self.seed.value(),
                 "obstacle": obst, "mode": self.mode(), "checkpoint": self.ckpt.currentData(),
-                "policy": policy, "steps": self.steps.value()}
+                "policy": policy, "steps": self.steps.value(), "stride": self.stride.currentData()}
 
     def apply_config(self, cfg):
         idx = next((i for i, (_, s, _) in enumerate(self._systems) if s is not None and s.name == cfg["system"]), None)
@@ -1479,6 +1897,7 @@ class MainWindow(QMainWindow):
                 self._set_value(self.param_widgets[sp.key], cfg["params"][sp.key])
         self.seed.setValue(int(cfg.get("seed", 0)))
         self.steps.setValue(int(cfg.get("steps", 400)))
+        self.stride.setCurrentIndex(max(0, self.stride.findData(int(cfg.get("stride", 1)))))
         pol = cfg.get("policy") or {}
         self.pol_every.setValue(int(pol.get("every") or 0))
         self.pol_res.setValue(float(pol.get("residual_tol") or 0))
@@ -1493,7 +1912,8 @@ class MainWindow(QMainWindow):
         obst = cfg.get("obstacle") or {}
         self.obstacle_size.setValue(float(obst.get("size", 0.2)))
         if backend.supports_obstacle(self.current_system()):
-            self.obstacle.setCurrentIndex([k for k, _ in OBSTACLES].index(obst.get("kind", "none")))
+            kind = obst.get("kind", "none")
+            self.obstacle.setCurrentIndex([k for k, _ in OBSTACLES].index(kind if kind != "tunnel" or self.tunnel else "none"))
             if obst.get("kind") == "photo" and obst.get("path"):
                 self._segment_photo(obst["path"])
         self._update_thumb()
@@ -1528,6 +1948,18 @@ class MainWindow(QMainWindow):
     def run(self):
         self.reset()
         cfg = self.config()
+        tun = cfg["obstacle"].get("kind") == "tunnel" and self.tunnel is not None
+        n = int(cfg["params"].get("n") or 256)
+        low = int(n * ((self.tunnel["meta"]["ground"] or 0.42) - 0.015)) if tun else 0
+        sprite = (self.tunnel["sprite"], self.tunnel["meta"]["box"], low) if tun else None
+        for view in (self.ref_view, self.cand_view):
+            view.sprite = sprite
+        self.cand_view.setVisible(cfg["mode"] != "reference")  # nothing to compare: hide the empty panel
+        if tun:
+            self.err_toggle.setChecked(False)
+        if tun:  # fixed scale: the impulsive start would otherwise set it far above the wake's vorticity
+            m = 5.0 * float(cfg["params"].get("U_inf") or 1.0)
+            self.scale, self.scale_fixed = ("div", -m, m), True
         r = Runner(cfg)
         # each slot ignores a runner that was reset away (its queued signals can still arrive)
         for sig, slot in ((r.started_run, self._on_started), (r.frames, self._on_frames), (r.done, self._on_done),
@@ -1564,6 +1996,7 @@ class MainWindow(QMainWindow):
             self.runner = None
         self.xs, self.err, self.diag_ref, self.diag_cand = [], [], {}, {}
         self.scale = self.run_obstacle = self.live = self._last_frame = None
+        self.scale_fixed = False
         self.spacing, self.summary, self.timing, self.horizon = 1, None, {}, None
         self._set_running(False)
         self.run_error.setText("")
@@ -1692,12 +2125,16 @@ class MainWindow(QMainWindow):
         name = self.current_system().fields[fi]
         self.cbar.symbol = {"vorticity": "ω", "temperature": "T"}.get(name, name[:2])
         r, c = fr.reference[fi], None if fr.candidate is None else fr.candidate[fi]
-        lo, hi = float(np.nanmin(r)), float(np.nanmax(r))
+        rr = r if self.run_obstacle is None or self.run_obstacle.shape != r.shape else r[~self.run_obstacle]
+        lo, hi = float(np.nanmin(rr)), float(np.nanmax(rr))  # the fluid only: a hot body would wash the plume out
         if self.scale is None:
-            self.scale = ("seq" if 0 <= lo < hi else "div", lo, hi)  # signed or all-zero -> diverging
+            self.scale = ("seq" if 0 <= lo < hi or name == "temperature" else "div", lo, hi)  # heat: fire colours  # signed or all-zero -> diverging
         kind, slo, shi = self.scale
         # from the reference only, and it only widens: decay shows as fading, a blown-up prediction saturates
-        self.scale = kind, min(slo, lo), max(shi, hi)
+        if name == "temperature" and lo > -0.25 * max(shi, hi, 1e-9):
+            lo = slo  # ignore small undershoots (spectral ripples next to a heated body): background stays black
+        if not getattr(self, "scale_fixed", False):
+            self.scale = kind, min(slo, lo), max(shi, hi)
         if kind == "div":
             m = max(abs(self.scale[1]), abs(self.scale[2]), 1e-30)
             vmin, vmax, lut = -m, m, DIVERGING
@@ -1705,6 +2142,9 @@ class MainWindow(QMainWindow):
             vmin, vmax, lut = self.scale[1], self.scale[2], SEQUENTIAL
         self.cbar.set_range(vmin, vmax, lut)
         self.ref_view.subtitle = f"{name}  ·  step {fr.step}  ·  x →  y ↑"
+        if self.run_obstacle is not None:  # soften the spectral ripples next to obstacles (display only)
+            from scipy.ndimage import gaussian_filter
+            r = gaussian_filter(np.asarray(r, np.float32), 0.8, mode="wrap")
         self.ref_view.set_field(r, vmin, vmax, lut, self.run_obstacle)
         self.counter.setText(f"step {fr.step} / {self.err_chart.xmax}     t = {fr.t:.4g}")
         if c is not None:

@@ -135,7 +135,8 @@ class Sam3Segmenter:
         log = open(Path(self._tmp) / "bridge.log", "w")
         self._proc = subprocess.Popen([str(self.python), str(BRIDGE), json.dumps(cfg)], stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1,
-                                      env={**os.environ, "PYTHONPATH": str(SAM3_CODE)})
+                                      env={**os.environ, "PYTHONPATH": str(SAM3_CODE)},
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console window
         atexit.register(self.close)
         self.last_info = self._read()
 

@@ -27,3 +27,4 @@ Thumbs.db
 HF_TOKEN*.txt
 *.token
 .env
+video/

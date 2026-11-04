@@ -66,7 +66,8 @@ def experiments():
     [{"name", "dir", "rows" (evaluate.table), "n_findings", "report" (path or None), "runtime"}]."""
     ev = _import("kolmo.evaluate")[0]
     root, out = ROOT / "runs", []
-    for res in sorted(root.glob("*/results.json"), key=lambda p: p.stat().st_mtime, reverse=True) if root.is_dir() else []:
+    found = [*root.glob("*/results.json"), *root.glob("assistant/*/results.json")] if root.is_dir() else []
+    for res in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             results = json.loads(res.read_text(encoding="utf-8"))
             diag = res.parent / "diagnosis.json"
@@ -78,10 +79,30 @@ def experiments():
             rows = ev.table(results) if ev else []
         except (KeyError, TypeError, AttributeError):  # results of another layout (e.g. latent studies): no table
             rows = []
-        out.append({"name": res.parent.name, "dir": str(res.parent), "rows": rows,
+        if not rows:
+            continue
+        out.append({"name": res.parent.name, "title": pretty_run(res.parent), "dir": str(res.parent), "rows": rows,
                     "n_findings": n, "report": str(rep) if rep.exists() else None,
                     "runtime": {m: r.get("runtime", {}) for m, r in results.items() if isinstance(r, dict)}})
     return out
+
+
+def pretty_run(d):
+    """Run directory -> short readable title: 'kolmogorov64_nca_ft-c42bef60' -> 'Kolmogorov64 nca ft';
+    an assistant run -> 'Assistant: build a lightweight nca surrogate for ca…'."""
+    d = Path(d)
+    if d.parent.name == "assistant":
+        try:
+            q = json.loads((d / "transcript.json").read_text(encoding="utf-8"))["question"]
+        except (OSError, ValueError, KeyError):
+            names = " ".join(p.stem for p in (d / "checkpoints").glob("*.json"))
+            sysname = next((s for s in ("gray_scott", "cahn_hilliard", "allen_cahn", "kuramoto_sivashinsky", "burgers",
+                                        "swift_hohenberg", "boussinesq", "fluid2d") if s in names), "study")
+            q = f"{sysname.replace('_', '-').title()} surrogate study"
+        q = q if len(q) <= 64 else q[:62].rsplit(" ", 1)[0] + "…"
+        return f"Assistant · {q}"
+    base = d.name.rsplit("-", 1)[0] if "-" in d.name and len(d.name.rsplit("-", 1)[1]) == 8 else d.name
+    return base.replace("_", " ").replace("-", " ").replace("ui ", "UI ").capitalize().replace("Ui ", "UI ")
 
 
 def all_checkpoints():
@@ -288,6 +309,12 @@ def obstacle_mask(spec, n):
     kind = (spec or {}).get("kind", "none")
     if kind == "none":
         return None
+    if kind == "tunnel":  # grid made on the Geometry page (kolmo.geometry.mask.tunnel_grid), y-up
+        g = np.asarray(spec["grid"], bool)
+        if g.shape != (n, n):
+            import cv2
+            g = cv2.resize(g.astype(np.uint8), (n, n), interpolation=cv2.INTER_NEAREST).astype(bool)
+        return g
     if kind == "photo":
         if not spec.get("path"):
             raise ValueError("photo obstacle without a photo path")
@@ -431,6 +458,8 @@ class LiveRun:
             self.policy = make_policy(cfg.get("policy"))
         elif self.mode not in ("reference", "surrogate"):
             raise ValueError(f"unknown mode {self.mode!r}")
+        if self.mode == "reference":  # several solver steps per frame, fused in one jitted call: long rollouts play fast
+            self.spacing = max(1, int(cfg.get("stride") or 1))
         self._ref_step = _need("kolmo.rollout").coarse(self.system.stepper(self.params), self.spacing)
         self._net = probe if self.mode == "surrogate" else None  # already compiled
         n_vals = int(np.prod(self.system.initial(self.params, self.seed).shape))
@@ -600,12 +629,12 @@ def models(system=None):
     yet ("registered": False; metrics read from their experiment's results.json), newest first. "path" = checkpoint stem."""
     reg, _ = _import("kolmo.surrogates.registry")
     out = [dict(e, registered=True) for e in (reg.list(system) if reg is not None else [])]
-    known = {str(Path(e["path"])) for e in out}
+    known = {str((ROOT / e["path"]).resolve()).lower() for e in out}
     for lbl, s, _ in systems():
         if s is None or (system and s.name != system):
             continue
         for label, stem in checkpoints(s):
-            if str(Path(stem)) in known:
+            if str((ROOT / stem).resolve()).lower() in known:
                 continue
             meta, run_dir = checkpoint_meta(stem), Path(stem).parent.parent
             rep, metrics = run_dir / "report.md", {}
@@ -621,7 +650,13 @@ def models(system=None):
                         "kind": meta.get("arch", {}).get("kind", "?"), "path": stem,
                         "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(Path(stem + ".json").stat().st_mtime)),
                         "metrics": metrics, "report": str(rep) if rep.exists() else None})
-    return sorted(out, key=lambda e: str(e.get("created", "")), reverse=True)
+    seen, uniq = set(), []
+    for e in sorted(out, key=lambda e: str(e.get("created", "")), reverse=True):
+        key = str((ROOT / e["path"]).resolve()).lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(e)
+    return uniq
 
 
 def register_model(stem):

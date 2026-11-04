@@ -104,6 +104,20 @@ calls, or with loose schemas. For that reason the schemas set `additionalPropert
 Any OpenAI-compatible endpoint works. `meta-models/muse-spark-open` is listed on Groq as a Preview, Enterprise-only
 model with tool use. Once enterprise access exists, switch to it by changing `KOLMO_LLM_MODEL`.
 
+### Rate limits and several keys
+
+`GROQ_API_KEY`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3` and so on are used in turn, one request each, so each key's
+tokens-per-minute budget is shared out. A key that answers HTTP 429 cools down for the wait the provider states and
+is skipped meanwhile. The agent waits only when every key is cooling (at most 20 minutes per task). The UI shows
+"live" and never the model ID.
+
+### Prompt-injection shield: Meta Llama Prompt Guard 2
+
+Before any tool runs, the task text goes to `meta-llama/llama-prompt-guard-2-86m`, which returns a probability that
+the text is a prompt attack. The status line shows the score; above 0.9 the task is refused (status `blocked`). If the
+check is unavailable (network or rate limit), it fails open and the task proceeds, so a network error never blocks
+work. Measured: a normal research request scored 0.0005, and "ignore all previous instructions…" scored 0.9996.
+
 ## Tests
 
 `python -m pytest tests/test_assistant.py -q` runs offline with tiny grids. It covers:

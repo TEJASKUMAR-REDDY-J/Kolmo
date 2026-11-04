@@ -1,6 +1,6 @@
 """Chat providers for the research assistant. Both speak one duck-typed interface:
 
-    provider.name -> str (shown in the UI: "offline · rule-based" or "live · <model>")
+    provider.name -> str (shown in the UI: "offline · rule-based" or "live")
     provider.chat(messages, tools) -> {"content": str, "tool_calls": [{"id", "name", "arguments": dict}]}
 
 messages / tools use the OpenAI chat-completions format. A live provider is used ONLY when F:/Kolmo/.env (or the
@@ -9,6 +9,7 @@ FakeProvider, which plans from fixed rules and explains only numbers it read fro
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -34,9 +35,50 @@ class RateLimited(RuntimeError):
 
 
 class OpenAIChatProvider:
-    def __init__(self, base_url, model, key, timeout=120):
-        self.url, self.model, self.key, self.timeout = base_url.rstrip("/") + "/chat/completions", model, key, timeout
-        self.name = f"live · {model}"
+    """OpenAI-compatible chat endpoint. Several API keys (GROQ_API_KEY, GROQ_API_KEY_2, ...) are used round-robin, so
+    the per-key tokens-per-minute limit is shared out; a key that returns HTTP 429 cools down for the time the provider
+    states and is skipped meanwhile. RateLimited is raised only when every key is cooling (wait = the shortest one).
+    The model id is never shown in the UI (name is just "live")."""
+    GUARD_MODEL = "meta-llama/llama-prompt-guard-2-86m"  # Meta Llama Prompt Guard 2: prompt-injection / jailbreak score
+
+    def __init__(self, base_url, model, keys, timeout=120):
+        keys = [keys] if isinstance(keys, str) else [k for k in keys if k]
+        if not keys:
+            raise ValueError("no API key")
+        self.base, self.model, self.keys, self.timeout = base_url.rstrip("/"), model, keys, timeout
+        self.url = self.base + "/chat/completions"
+        self.cool = [0.0] * len(keys)  # monotonic time until which each key is rate limited
+        self.next = 0
+        self.name = "live"
+
+    def _key(self):
+        now = time.monotonic()
+        for i in range(len(self.keys)):
+            j = (self.next + i) % len(self.keys)
+            if self.cool[j] <= now:
+                self.next = j + 1
+                return j
+        raise RateLimited(min(self.cool) - now, f"all {len(self.keys)} API key(s) are rate limited")
+
+    def _post(self, body, j):
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), method="POST",
+                                     headers={"Authorization": f"Bearer {self.keys[j]}", "Content-Type": "application/json",
+                                              "User-Agent": "kolmo/0.1"})  # the API's firewall rejects urllib's default agent (HTTP 403)
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return json.load(r)["choices"][0]["message"]
+
+    def _request(self, body):
+        while True:  # rotate through keys until one answers or all are cooling (RateLimited from _key)
+            j = self._key()
+            try:
+                return self._post(body, j)
+            except urllib.error.HTTPError as e:  # surface the provider's reason (e.g. terms not accepted, rate limit)
+                text = e.read().decode(errors="replace")
+                if e.code != 429:
+                    raise RuntimeError(f"LLM provider HTTP {e.code}: {text[:400]}") from None
+                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", text)
+                wait = (60 * int(m.group(1) or 0) + float(m.group(2))) if m else float(e.headers.get("retry-after") or 30)
+                self.cool[j] = time.monotonic() + wait + 0.5
 
     def chat(self, messages, tools):
         body = {"model": self.model, "messages": messages, "temperature": 0}
@@ -44,29 +86,28 @@ class OpenAIChatProvider:
             body.update(tools=tools, tool_choice="auto", parallel_tool_calls=False)
         if "gpt-oss" in self.model:
             body["reasoning_effort"] = "medium"
-        req = urllib.request.Request(self.url, json.dumps(body).encode(), method="POST",
-                                     headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
-                                              "User-Agent": "kolmo/0.1"})  # the API's firewall rejects urllib's default agent (HTTP 403)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                msg = json.load(r)["choices"][0]["message"]
-        except urllib.error.HTTPError as e:  # surface the provider's reason (e.g. terms not accepted, rate limit)
-            body = e.read().decode(errors="replace")
-            if e.code == 429:
-                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", body)
-                wait = (60 * int(m.group(1) or 0) + float(m.group(2))) if m else float(e.headers.get("retry-after") or 30)
-                raise RateLimited(wait, f"LLM provider HTTP 429: {body[:300]}") from None
-            raise RuntimeError(f"LLM provider HTTP {e.code}: {body[:400]}") from None
+        msg = self._request(body)
         calls = [{"id": c["id"], "name": c["function"]["name"], "arguments": json.loads(c["function"]["arguments"] or "{}")}
                  for c in msg.get("tool_calls") or []]
         return {"content": msg.get("content") or "", "tool_calls": calls}
 
+    def guard(self, text):
+        """Llama Prompt Guard 2 probability that `text` is a prompt attack (0..1), or None if the check is unavailable
+        (fail open: the shield never blocks a task because of a network error)."""
+        try:
+            return float(self._request({"model": self.GUARD_MODEL, "messages": [{"role": "user", "content": text[:2000]}]})
+                         ["content"])
+        except (RuntimeError, RateLimited, OSError, ValueError, KeyError):
+            return None
+
 
 def get_provider(env=None):
     e = load_env() if env is None else env
-    if e.get("KOLMO_LLM_LIVE") == "1" and e.get("GROQ_API_KEY"):
+    keys = [e.get("GROQ_API_KEY")] + [e[k] for k in sorted(e) if re.fullmatch(r"GROQ_API_KEY_\d+", k)]
+    keys = [k for k in keys if k]
+    if e.get("KOLMO_LLM_LIVE") == "1" and keys:
         return OpenAIChatProvider(e.get("KOLMO_LLM_BASE_URL", "https://api.groq.com/openai/v1"),
-                                  e.get("KOLMO_LLM_MODEL", "meta-models/muse-spark-open"), e["GROQ_API_KEY"])
+                                  e.get("KOLMO_LLM_MODEL", "openai/gpt-oss-120b"), keys)
     return FakeProvider()
 
 

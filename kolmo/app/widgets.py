@@ -236,7 +236,7 @@ class FieldView(QWidget):
         super().__init__()
         self.title, self.qualifier, self.subtitle, self.empty = title, qualifier, "", "No data yet."
         self.bar = bar
-        self.image = self.overlay = None
+        self.image = self.overlay = self.sprite = None  # sprite: (QImage RGBA photo, (col0, row0, cols, rows) y-up)
         self.vmin = self.vmax = 0.0
         self.lut = DIVERGING
         self.setMinimumSize(180, 220)
@@ -269,6 +269,15 @@ class FieldView(QWidget):
         top, bar = 44, (30 if self.bar else 2)
         side = max(10, min(w, h - top - bar))
         box = QRectF((w - side) / 2, top, side, side)
+        src = None
+        if self.sprite is not None and self.image is not None:  # wind tunnel: a wide band around the road
+            bw = float(w)
+            bh = min(h - top - bar, bw * 9 / 16)
+            bw = bh * 16 / 9
+            box = QRectF((w - bw) / 2, top, bw, bh)
+            n = self.image.width()
+            rows = n * bh / bw
+            src = QRectF(0, n - self.sprite[2] - rows, n, rows)  # sprite[2]: lowest y-up row shown
         clip = QPainterPath()
         clip.addRoundedRect(box, 14, 14)
         if self.image is None:
@@ -282,10 +291,19 @@ class FieldView(QWidget):
         p.save()
         p.setClipPath(clip)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        p.drawImage(box, self.image)
-        if self.overlay is not None:
+        if src is not None:
+            p.drawImage(box, self.image, src)
+        else:
+            p.drawImage(box, self.image)
+        if self.overlay is not None and self.sprite is None:
             p.setRenderHint(QPainter.SmoothPixmapTransform, False)
             p.drawImage(box, self.overlay)
+        if self.sprite is not None and self.overlay is not None:  # the photo itself, exactly over its obstacle cells
+            img, (c0, r0, cw, ch), _ = self.sprite
+            n, s = self.image.width(), box.width() / self.image.width()
+            p.drawImage(box, self.overlay, src)  # obstacle cells (the road) under the photo
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawImage(QRectF(box.left() + c0 * s, box.top() + (n - r0 - ch - src.top()) * s, cw * s, ch * s), img)
         p.restore()
         p.setPen(QPen(QColor(255, 255, 255, 50), 1))
         p.drawPath(clip)
