@@ -84,7 +84,7 @@ These are enforced in code, not left to the model.
 ```
 GROQ_API_KEY=...
 KOLMO_LLM_BASE_URL=https://api.groq.com/openai/v1
-KOLMO_LLM_MODEL=openai/gpt-oss-120b
+KOLMO_LLM_MODEL=meta-models/muse-spark-open
 KOLMO_LLM_LIVE=1
 ```
 
@@ -101,8 +101,8 @@ Calls are sent with:
 Groq users report that gpt-oss tool calling fails more often with `tool_choice` set to `required`, with parallel
 calls, or with loose schemas. For that reason the schemas set `additionalProperties: false` at the top level.
 
-Any OpenAI-compatible endpoint works. `meta-models/muse-spark-open` is listed on Groq as a Preview, Enterprise-only
-model with tool use. Once enterprise access exists, switch to it by changing `KOLMO_LLM_MODEL`.
+The default model is Meta's Muse Spark on Groq (`meta-models/muse-spark-open`, a preview model with tool use; Groq
+lists it for enterprise access). Any OpenAI-compatible model works: set `KOLMO_LLM_MODEL` (and `KOLMO_LLM_BASE_URL`).
 
 ### Rate limits and several keys
 

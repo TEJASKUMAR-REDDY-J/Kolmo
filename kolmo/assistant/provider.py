@@ -107,7 +107,7 @@ def get_provider(env=None):
     keys = [k for k in keys if k]
     if e.get("KOLMO_LLM_LIVE") == "1" and keys:
         return OpenAIChatProvider(e.get("KOLMO_LLM_BASE_URL", "https://api.groq.com/openai/v1"),
-                                  e.get("KOLMO_LLM_MODEL", "openai/gpt-oss-120b"), keys)
+                                  e.get("KOLMO_LLM_MODEL", "meta-models/muse-spark-open"), keys)
     return FakeProvider()
 
 
