@@ -7,7 +7,6 @@ seeds with every combination of `heldout` values (parameter values never seen in
 Normalisation: per-channel mean/std over all train states; conditioning params mean/std over train trajectories
 (std 0 -> 1). Cached as runs/cache/data-<hash>.npz, hash = sha1 of the system name + config JSON."""
 import hashlib
-import importlib
 import itertools
 import json
 import os
@@ -17,12 +16,14 @@ import numpy as np
 
 from kolmo.rollout import coarse
 
-SYSTEMS = {"diffusion": "kolmo.systems.diffusion:Diffusion", "fluid2d": "kolmo.systems.fluid2d:Fluid2D"}
+def get_system(ref):
+    """Registered name or PDE spec dict (docs/contracts.md) -> System, via kolmo.systems.make."""
+    from kolmo import systems
+    return systems.make(ref)
 
 
-def get_system(name):
-    mod, cls = SYSTEMS[name].split(":")
-    return getattr(importlib.import_module(mod), cls)()
+def system_name(ref):
+    return ref.get("name", "pde") if isinstance(ref, dict) else ref
 
 
 @dataclass
@@ -40,8 +41,7 @@ class DataConfig:
     cond: list = field(default_factory=list)  # param names fed to the model as constant channels
 
     def validate(self):
-        if self.system not in SYSTEMS:
-            raise ValueError(f"unknown system {self.system!r}; known: {sorted(SYSTEMS)}")
+        get_system(self.system)  # unknown names and invalid PDE specs raise ValueError
         if self.steps < 1 or self.spacing < 1 or self.burn_in < 0:
             raise ValueError("steps and spacing must be >= 1, burn_in >= 0")
         seeds = [set(self.train_seeds), set(self.val_seeds), set(self.test_seeds)]
@@ -114,7 +114,7 @@ def build(cfg: DataConfig, cache_dir="runs/cache", verbose=True) -> Dataset:
     """Generate (or load from cache) the dataset described by cfg."""
     cfg.validate()
     system = get_system(cfg.system)
-    path = os.path.join(cache_dir, f"data-{cfg.system}-{cfg.hash()}.npz")
+    path = os.path.join(cache_dir, f"data-{system_name(cfg.system)}-{cfg.hash()}.npz")
     if os.path.exists(path):
         z = np.load(path)
         splits = {name: Split(z[f"{name}/states"], z[f"{name}/cond"], json.loads(str(z[f"{name}/params"])),

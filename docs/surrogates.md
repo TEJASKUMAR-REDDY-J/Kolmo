@@ -80,3 +80,33 @@ the conditioning values over train trajectories (std 0 -> 1). Datasets are cache
   drifted state, so its cost is real and it cannot undo divergence that already happened.
 * Fluid2D's `residual()` re-validates its parameters including the CFL limit, so it refuses dt = spacing x dt; the
   residual metric and the residual trigger are then reported as unavailable (recorded in the results, never invented).
+
+## NCA-hybrid (`kind: "nca_hybrid"`)
+
+Per step, two branches run in parallel on h = 1x1 lift of [state, parameter planes, pos planes] to C + `hidden`
+channels, and their outputs are summed into the residual update:
+* local NCA rule: a fixed periodic 3x3 perception (identity, Sobel x / 8, Sobel y / 8, 5-point Laplacian per channel),
+  then a 1x1 MLP (`width`, GELU) with a zero-initialised output;
+* global spectral pass: SpectralConv on the lowest `modes` x `modes` Fourier modes, GELU, then a zero-initialised 1x1.
+Defaults (`hidden` 8, `width` 48, `modes` 8, `pos` 4): about 23k weights at C = 1, P = 1, tested < 30k. It is
+translation-equivariant when `pos` = 0 (tested). `hidden` channels are latent within one step only, because the state
+contract is (C, H, W).
+
+## Training noise (`TrainConfig.noise`)
+
+Gaussian noise of std `noise` (normalised units) is added to the input state of every training window; targets stay
+clean, so the network learns to map slightly-off states back towards the data manifold it will meet in its own
+rollouts. Basis: Sanchez-Gonzalez et al., "Learning to simulate complex physics with graph networks", ICML 2020;
+Stachenfeld et al., "Learned coarse models for efficient turbulence simulation", ICLR 2022 (arXiv 2112.15275), where
+training noise and temporal downsampling made learned 2D-turbulence rollouts stable. Also considered: PDE-Refiner
+(Lippe et al., NeurIPS 2023; multi-step refinement, costs several network calls per step) and spectral shaping of the
+loss (OpenReview 2025); neither is as cheap. Result on Kolmogorov flow: see docs/evaluation.md.
+
+## Registry and training progress (docs/contracts.md)
+
+`kolmo.surrogates.registry`: `list(system=None)`, `register(run_dir, name=None)`, `load(id)`, `remove(id)` (unregisters
+only; files stay), stored in `runs/registry.json`. `kolmo.experiments` registers every trained model of a run. Entry
+metrics: `one_step`, `error_at_10`, `steps_to_failure` (median, test split), `surrogate_ms_per_step`, `speedup`.
+`train.fit(ds, cfg, on_progress=None, should_stop=None)` (`train.train` is an alias): progress dicts
+`{"phase", "step", "total", "loss", "val_rollout_error", "eta_s"}` at most 4 per second; `should_stop()` is polled every
+step and ends training after one final validation.

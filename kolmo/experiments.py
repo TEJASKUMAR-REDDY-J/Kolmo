@@ -18,7 +18,7 @@ import numpy as np
 from kolmo import diagnose as dg
 from kolmo import evaluate as ev
 from kolmo.hybrid import HybridPolicy
-from kolmo.surrogates import data, train
+from kolmo.surrogates import data, registry, train
 
 
 @dataclass
@@ -98,8 +98,10 @@ def run(cfg: ExperimentConfig, verbose=True):
     plots = ev.plot(clean, out)
     with open(f"{out}/report.md", "w") as f:
         f.write(report(cfg, clean, findings, plots, time.perf_counter() - t0))
+    for name in mcfgs:
+        registry.register(out, name, root=cfg.out_dir)
     if verbose:
-        print(f"wrote {out}")
+        print(f"wrote {out} (models registered in {cfg.out_dir}/registry.json)")
     return out, clean, findings
 
 

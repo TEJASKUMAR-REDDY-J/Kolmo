@@ -104,7 +104,37 @@ class FNO(nn.Module):
         return z + jnp.moveaxis(dz, -1, 1)
 
 
-ARCHS = {"cnn": ResCNN, "fno": FNO}
+def _perceive(h):
+    """Fixed periodic 3x3 perception per channel: identity, Sobel x, Sobel y (both / 8), 5-point Laplacian.
+    (B, H, W, ch) -> (B, H, W, 4 ch), in grid-cell units."""
+    r = lambda dy, dx: jnp.roll(h, (dy, dx), (1, 2))  # r(dy, dx)[i, j] = h[i - dy, j - dx]
+    gx = (r(1, -1) + 2 * r(0, -1) + r(-1, -1)) - (r(1, 1) + 2 * r(0, 1) + r(-1, 1))
+    gy = (r(-1, 1) + 2 * r(-1, 0) + r(-1, -1)) - (r(1, 1) + 2 * r(1, 0) + r(1, -1))
+    lap = r(1, 0) + r(-1, 0) + r(0, 1) + r(0, -1) - 4 * h
+    return jnp.concatenate([h, gx / 8, gy / 8, lap], -1)
+
+
+class NCAHybrid(nn.Module):
+    """Neural-cellular-automaton rule plus a global spectral pass, applied in parallel and summed:
+    h = 1x1 lift of [state, param planes, pos planes] to C + hidden channels (hidden = per-step latent channels);
+    local  = 1x1 MLP(width, GELU) of the fixed 3x3 perception of h (identity, Sobel x/y, Laplacian), zero-init output;
+    global = 1x1(GELU(SpectralConv(h, modes))), zero-init output;  z_next = z + local + global.
+    Translation-equivariant when pos = 0. About 23k parameters at C=1, P=1, pos=4, hidden=8, width=48, modes=8."""
+    hidden: int = 8
+    width: int = 48
+    modes: int = 8
+    pos: int = 0
+
+    @nn.compact
+    def __call__(self, z, c):
+        C = z.shape[1]
+        h = nn.Dense(C + self.hidden)(_planes(z, c, self.pos))
+        local = nn.Dense(C, kernel_init=nn.initializers.zeros)(nn.gelu(nn.Dense(self.width)(_perceive(h))))
+        glob = nn.Dense(C, kernel_init=nn.initializers.zeros)(nn.gelu(SpectralConv(C + self.hidden, self.modes)(h)))
+        return z + jnp.moveaxis(local + glob, -1, 1)
+
+
+ARCHS = {"cnn": ResCNN, "fno": FNO, "nca_hybrid": NCAHybrid}
 
 
 def build(arch: dict) -> nn.Module:

@@ -116,3 +116,44 @@ Hybrid: surrogate only 1.69, every 10 (10 % cost) 1.56, every 2 (50 % cost) 1.45
 Runtime: FNO 12.8 ms vs reference 8.4 ms per surrogate step: speedup 0.655x (slower than the solver at 64x64 on CPU).
 Measured: the FNO's time-to-failure is 3x the CNNs' (15 vs 4-5 steps) and its 10-step error is less than half (0.38 vs
 0.79-0.86). This comes from one-step training, so here the architecture mattered more than rollout-aware training.
+
+### Re-evaluation incl. residual and rollout statistics (`benchmarks/reeval.json`, run `runs/kolmogorov64_reeval-ae78c28e`)
+
+Same split as before (8 test trajectories, 200 steps). CNN and FNO-1 checkpoints were reused, and the reused models
+reproduce their earlier numbers exactly. FNO fine-tunes start from FNO-1: K=2 (400 steps, lr 3e-4, 4.8 min), then K=4
+(stopped by the 10-min cap, 10.9 min). spec = median over trajectories of the time-mean log-spectrum error (dex,
+k <= 21). E/Z = time-mean energy/enstrophy relative error. res = surrogate/reference residual ratio (median; the
+reference floor at stride 10 is about 0.06).
+
+| model | relL2@1 | @10 | @50 | @200 | median ttf | spec (dex) | E err | Z err | res ratio | heldout-nu @10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| CNN-1 | 0.193 | 0.858 | 1.21 | 1.5e3 | 4 | 3.37 | +4e4 | +1e5 | 14.9 | 0.802 |
+| CNN-4 | 0.208 | 0.791 | 1.17 | 2.20 | 5 | 1.25 | +1.65 | +0.50 | 11.4 | 0.783 |
+| FNO-1 | 0.149 | 0.376 | 1.33 | 1.54 | 15 | 0.559 | +0.10 | +0.24 | 2.62 | 0.318 |
+| FNO-ft K2 | 0.148 | 0.323 | 1.18 | 1.60 | 19 | 0.565 | +0.26 | +0.34 | 2.67 | 0.247 |
+| FNO-ft K4 | 0.149 | 0.310 | 1.12 | 1.46 | 21 | 0.602 | +0.26 | +0.19 | 2.48 | 0.216 |
+
+Hybrid, max of the median relL2 (cost %): re-anchoring every 10 steps (10 %): CNN-1 1.45, CNN-4 1.71, FNO-1 1.56,
+K2 1.64, K4 1.47. Residual trigger > 0.3: CNNs 100 % cost (every proposal rejected, so this is the reference run);
+FNOs 42-48 % cost and 1.51-1.58, so the trigger never keeps the error below 0.5.
+Measured: rollout fine-tuning of the FNO raises time-to-failure from 15 to 21 steps, lowers the step-10 error from
+0.376 to 0.310 and the held-out-nu step-10 error from 0.318 to 0.216; the one-step error is unchanged (0.149). Its
+time-mean statistics do not improve (energy error +0.10 -> +0.26, spectrum 0.56 -> 0.60 dex). No model reproduces the
+long-run statistics within 10 %.
+
+### NCA-hybrid vs FNO vs CNN-4 (`benchmarks/nca.json`, run `runs/kolmogorov64_nca-1fad30ba`; others from the re-eval run)
+
+Same split. ms/step = surrogate steady state, batch 1, shared CPU (the reference is 5-9 ms per 10 solver steps).
+
+| model | weights | relL2@1 | @10 | median ttf | nonphysical steps | spec (dex) | E err | ms/step | speedup | train min |
+|---|---|---|---|---|---|---|---|---|---|---|
+| CNN-4 | 33,249 | 0.208 | 0.791 | 5 | 0 | 1.25 | +1.65 | 7.75 | 1.15x | 21 |
+| FNO-1 | 1,331,209 | 0.149 | 0.376 | 15 | 0 | 0.56 | +0.10 | 14.4 | 0.70x | 11.5 |
+| FNO-ft K4 | 1,331,209 | 0.149 | 0.310 | 21 | 0 | 0.60 | +0.26 | 15.1 | 0.50x | 10.9 + 4.8 |
+| NCA-hybrid | 22,742 | 0.192 | 0.553 | 8 | 1007 | 11.7 | +6e12 | 5.34 | 1.45x | 4.6 |
+| NCA-hybrid + noise 0.05 | 22,742 | 0.191 | 0.523 | 9 | 283 | 1.27 | +41 | 3.78 | 1.53x | 4.8 |
+
+Measured: with 1.7 % of the FNO's weights the NCA-hybrid beats the CNN (step-10 error 0.55 vs 0.79, failure at step 8 vs 5)
+and is the fastest model, but it blows up later in the rollout (1007 nonphysical steps). Training noise 0.05 cut
+those to 283 (-72 %) and the spectrum error from 11.7 to 1.27 dex, with unchanged one-step error. It does not remove
+the instability. Next: NCA-hybrid with noise plus rollout fine-tuning (K=2 -> 4), which helped the FNO.

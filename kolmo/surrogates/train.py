@@ -37,6 +37,8 @@ class TrainConfig:
     patience: int = 5  # evaluations without improvement before stopping
     max_minutes: float = 20.0  # wall-clock cap
     init_from: str = ""  # start from this checkpoint (path without extension; in an experiment: an earlier model's name)
+    noise: float = 0.0  # std of Gaussian noise added to the input state (normalised units), targets clean
+    # (training noise, Sanchez-Gonzalez et al. 2020; Stachenfeld et al. ICLR 2022 for 2D turbulence)
 
     def validate(self):
         if self.unroll < 1 or self.steps < 1 or self.batch < 1 or self.val_horizon < 1 or self.patience < 1:
@@ -55,9 +57,24 @@ def surrogate_from(ds, net, params) -> Surrogate:
     return Surrogate(net, params, ds.mean, ds.std, tuple(ds.config.cond), ds.cond_mean, ds.cond_std, ds.config.spacing)
 
 
-def train(ds, cfg: TrainConfig, verbose=True):
-    """Returns (Surrogate with the best-validation params, history list of dicts)."""
+def fit(ds, cfg: TrainConfig, verbose=True, on_progress=None, should_stop=None):
+    """Returns (Surrogate with the best-validation params, history list of dicts).
+    on_progress(dict) receives {"phase": "data"|"train"|"eval", "step", "total", "loss", "val_rollout_error",
+    "eta_s"} at most 4 times per second (phase changes and evaluations always); should_stop() is polled every
+    optimiser step and ends training after a final validation (history "stopped": "cancelled")."""
     cfg.validate()
+    t_start, last = time.perf_counter(), [-1.0]
+
+    def progress(phase, step, loss=None, val=None, force=False):
+        now = time.perf_counter()
+        if on_progress is None or (not force and now - last[0] < 0.25):
+            return
+        last[0] = now
+        eta = (now - t_start) / step * (cfg.steps - step) if step else None
+        on_progress({"phase": phase, "step": step, "total": cfg.steps, "loss": None if loss is None else float(loss),
+                     "val_rollout_error": val, "eta_s": eta})
+
+    progress("data", 0, force=True)
     net = build(cfg.model)
     tr, va = ds.splits["train"], ds.splits["val"]
     if cfg.unroll >= tr.states.shape[1]:
@@ -89,7 +106,8 @@ def train(ds, cfg: TrainConfig, verbose=True):
         return jnp.mean(jnp.stack(losses))
 
     @jax.jit
-    def update(p, o, z, c, targets):
+    def update(p, o, z, c, targets, key):
+        z = z + cfg.noise * jax.random.normal(key, z.shape, z.dtype)  # training noise on the input only
         loss, g = jax.value_and_grad(loss_fn)(p, z, c, targets)
         u, o = opt.update(g, o, p)
         return optax.apply_updates(p, u), o, loss
@@ -105,6 +123,7 @@ def train(ds, cfg: TrainConfig, verbose=True):
         return jnp.where(jnp.isfinite(err), err, 1e3).mean()
 
     rng = np.random.default_rng(cfg.seed)
+    noise_key = jax.random.PRNGKey(cfg.seed + 1)
     N, T1 = X.shape[:2]
     K = cfg.unroll
     best, best_params, bad, hist, losses = np.inf, params, 0, [], []
@@ -113,10 +132,15 @@ def train(ds, cfg: TrainConfig, verbose=True):
         i = rng.integers(0, N, cfg.batch)
         t = rng.integers(0, T1 - K, cfg.batch)
         win = X[i[:, None], t[:, None] + np.arange(K + 1)[None]]  # (B, K+1, C, H, W)
-        params, opt_state, loss = update(params, opt_state, win[:, 0], Cn[i], win[:, 1:])
+        params, opt_state, loss = update(params, opt_state, win[:, 0], Cn[i], win[:, 1:],
+                                         jax.random.fold_in(noise_key, it))
         losses.append(loss)
-        if it % cfg.eval_every == 0 or it == cfg.steps:
+        progress("train", it, loss)
+        cancel = bool(should_stop and should_stop())
+        if it % cfg.eval_every == 0 or it == cfg.steps or cancel:
+            progress("eval", it, loss, force=True)
             v = float(val_error(params))
+            progress("eval", it, loss, v, force=True)
             minutes = (time.perf_counter() - t0) / 60
             hist.append({"step": it, "train_loss": float(np.mean(jnp.stack(losses))), "val_rollout_rel_l2": v,
                          "minutes": round(minutes, 3)})
@@ -128,10 +152,13 @@ def train(ds, cfg: TrainConfig, verbose=True):
                 best, best_params, bad = v, params, 0
             else:
                 bad += 1
-            if bad >= cfg.patience or minutes > cfg.max_minutes:
-                hist[-1]["stopped"] = "patience" if bad >= cfg.patience else "time"
+            if cancel or bad >= cfg.patience or minutes > cfg.max_minutes:
+                hist[-1]["stopped"] = "cancelled" if cancel else "patience" if bad >= cfg.patience else "time"
                 break
     return surrogate_from(ds, net, best_params), hist
+
+
+train = fit  # older name
 
 
 def save(path, sur: Surrogate, ds, cfg: TrainConfig, history, train_minutes=None):
