@@ -50,3 +50,6 @@ These edits were blocked by tool-permission timeouts:
 2. Optional: a mask that scales with the grid, or a smoothed mask, to get a clean Cd convergence study. Today Cd is
    dominated by the staircase extent D, which ranges from 0.92 to 1.08 across n.
 3. Optional: rerun the benchmark on an idle machine and replace the performance table.
+
+## Update 2026-11-04
+Cosmetic edits applied. Added pde.py (ETDRK4, spec grammar, 6-model library), boussinesq.py, fluid2d beta-plane + vortex IC, systems registry (SYSTEMS/make/describe), common.py. `python -m pytest tests/test_boussinesq.py tests/test_pde.py tests/test_fluid2d.py -q -s` -> 22 passed in 91.93s. Details in physics.md.

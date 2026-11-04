@@ -121,3 +121,42 @@ if __name__ == "__main__":
             t = time.perf_counter()
             fn()
             print(f"PASS {name} ({time.perf_counter() - t:.1f} s)")
+
+
+def test_beta_plane_rossby_dispersion():
+    p = S.validate({"n": 32, "nu": 1e-3, "beta": 2.0, "ic": "zero", "dt": 0.05})
+    x = np.arange(32) * 2 * math.pi / 32
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    kx, ky, T = 2, 1, 5.0
+    tr = S.rollout(p, np.cos(kx * X + ky * Y)[None].astype(np.float32), 100, every=100)
+    sigma = -p["beta"] * kx / (kx * kx + ky * ky)  # westward phase speed
+    exact = np.cos(kx * X + ky * Y - sigma * T) * math.exp(-p["nu"] * (kx * kx + ky * ky) * T)
+    err = np.abs(tr.states[-1][0] - exact).max()
+    print(f"Rossby wave: phase moved {sigma * T:.2f} rad, max error {err:.1e}")
+    assert err < 1e-4
+
+
+def test_beta_drift_and_merger():
+    L, n = 2 * math.pi, 64
+    peak = lambda w: np.array(np.unravel_index(np.argmax(w), w.shape))[::-1] * L / n  # (x, y)
+    moves = {}
+    for beta in (0.0, 2.0):
+        p = S.validate({"n": n, "nu": 1e-3, "beta": beta, "ic": "vortices", "vortices": [(L / 2, L / 2, 0.5, 5.0)]})
+        steps = int(4 / p["dt"])
+        tr = S.rollout(p, S.initial(p, 0), steps, every=steps)
+        moves[beta] = peak(tr.states[-1][0]) - peak(tr.states[0][0])
+    print(f"cyclone peak displacement over t = 4: beta=0 {moves[0.0]}, beta=2 {np.round(moves[2.0], 2)}")
+    assert np.all(moves[0.0] == 0) and moves[2.0][0] < -0.3 and moves[2.0][1] > 0.3  # north-west drift
+
+    def peaks(w):
+        nb = np.max([np.roll(np.roll(w, a, 0), b, 1) for a in (-1, 0, 1) for b in (-1, 0, 1) if (a, b) != (0, 0)], 0)
+        return int(((w >= nb) & (w > 0.5 * w.max())).sum())
+    counts = {}
+    for d in (1.2, 2.0):
+        p = S.validate({"n": n, "nu": 1e-3, "ic": "vortices",
+                        "vortices": [(L / 2 - d / 2, L / 2, 0.4, 5.0), (L / 2 + d / 2, L / 2, 0.4, 5.0)]})
+        steps = int(30 / p["dt"])
+        tr = S.rollout(p, S.initial(p, 0), steps, every=steps // 6)
+        counts[d] = [peaks(s[0]) for s in tr.states]
+    print(f"co-rotating pair, R = 0.4, peak counts every t = 5: d = 1.2 {counts[1.2]}, d = 2.0 {counts[2.0]}")
+    assert counts[1.2][0] == 2 and counts[1.2][-1] == 1 and counts[2.0][-1] == 2

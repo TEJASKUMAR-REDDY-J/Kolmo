@@ -50,6 +50,15 @@ class Diffusion:
         s = np.asarray(state[0], np.float64)
         return {"mean": float(s.mean()), "variance": float(s.var()), "max_abs": float(np.abs(s).max())}
 
+    def describe(self):
+        info = {"n": (8, 512, "cells", "grid size"), "L": (0, None, "length", "box side"),
+                "kappa": (0, None, "L^2/T", "diffusivity"), "dt": (0, None, "T", "time step"),
+                "modes": (1, None, "1", "random IC modes")}
+        return {"name": self.name, "fields": list(self.fields), "equations": "dT/dt = kappa lap T",
+                "params": {k: {"default": self.DEFAULTS[k], "min": a, "max": b, "unit": u, "help": h}
+                           for k, (a, b, u, h) in info.items()},
+                "checks": ["exact per Fourier mode", "mean conserved"]}
+
     def residual(self, prev, nxt, params):
         """|| (nxt - prev)/dt - kappa lap((prev + nxt)/2) || / || (nxt - prev)/dt ||  (Crank-Nicolson form)."""
         p = self.validate(params)

@@ -17,7 +17,7 @@ import numpy as np
 from kolmo.core import Trajectory
 
 CFL_STABLE = 3 * math.sqrt(3) / (2 * math.pi)  # IF-RK3 + 2/3 dealiasing linear advection bound on dt*max(|u|+|v|)/dx
-DYNAMIC = ("nu", "mu", "A", "dt", "U_inf", "eta", "sponge_rate", "chi")  # may differ across a batch (vmapped)
+DYNAMIC = ("nu", "mu", "A", "dt", "U_inf", "eta", "sponge_rate", "beta", "chi")  # may differ across a batch (vmapped)
 STATIC = ("n", "L", "kf", "sponge")  # must be equal across a batch
 
 
@@ -30,7 +30,9 @@ class Fluid2D:
         "mu": 0.0,  # linear drag
         "A": 0.0, "kf": 4,  # Kolmogorov body force f_x = -A sin(k y), k = 2 pi kf / L  ->  f_w = A k cos(k y)
         "dt": None, "cfl_max": 0.5,  # dt = None picks the largest dt with estimated CFL <= cfl_max
-        "ic": None, "ic_amp": 1.0, "ic_k": (1, 6), "tg_k": 1,  # ic: "random" | "taylor_green" | "zero"
+        "ic": None, "ic_amp": 1.0, "ic_k": (1, 6), "tg_k": 1,  # ic: "random" | "taylor_green" | "zero" | "vortices"
+        "vortices": None,  # [(x, y, radius, peak vorticity), ...] Gaussian vortices; default one cyclone at the centre
+        "beta": 0.0,  # beta-plane: -beta v on the right-hand side (Coriolis gradient along +y)
         "mask": None, "U_inf": 0.0, "eta": 1e-3,  # obstacle (H, W) bool, free stream along +x, penalisation time
         "sponge": None, "sponge_rate": None,  # fringe strip width (fraction of L) at the right edge, rate 1/time
     }
@@ -45,7 +47,7 @@ class Fluid2D:
         if not L > 0:
             raise ValueError("L must be positive")
         dx, K = L / n, (n - 1) // 3  # K: largest mode kept by the 2/3 rule
-        for k in ("mu", "ic_amp", "U_inf", "A", "cfl_max", "eta"):
+        for k in ("mu", "ic_amp", "U_inf", "A", "cfl_max", "eta", "beta"):
             p[k] = float(p[k])
         if p["mu"] < 0 or p["ic_amp"] < 0 or p["U_inf"] < 0:
             raise ValueError("mu, ic_amp and U_inf must be >= 0")
@@ -67,8 +69,15 @@ class Fluid2D:
                 raise ValueError("mask must be neither empty nor full")
         p["D"] = float(mask.any(axis=1).sum() * dx) if mask is not None else None  # cross-stream extent
         p["ic"] = p["ic"] or ("zero" if mask is not None else "random")
-        if p["ic"] not in ("random", "taylor_green", "zero"):
-            raise ValueError("ic must be 'random', 'taylor_green' or 'zero'")
+        if p["ic"] not in ("random", "taylor_green", "zero", "vortices"):
+            raise ValueError("ic must be 'random', 'taylor_green', 'zero' or 'vortices'")
+        if p["vortices"] is None:
+            p["vortices"] = [(L / 2, L / 2, L / 12, 5.0)]
+        try:
+            p["vortices"] = [tuple(float(c) for c in v) for v in p["vortices"]]
+            assert all(len(v) == 4 and v[2] > 0 for v in p["vortices"])
+        except (TypeError, ValueError, AssertionError):
+            raise ValueError("vortices must be a list of (x, y, radius > 0, peak vorticity)") from None
 
         # viscosity from nu or Re = U_ref L_ref / nu
         k = 2 * math.pi * p["kf"] / L
@@ -94,7 +103,9 @@ class Fluid2D:
 
         # CFL: dt * max(|u| + |v|) / dx <= cfl_max, with max(|u|+|v|) estimated a priori
         S = p["U_inf"] * (2 if mask is not None else 1)  # flow speeds up around a body
-        S += {"random": 4.0, "taylor_green": 1.0, "zero": 0.0}[p["ic"]] * p["ic_amp"]  # random: peak ~ 4 x rms
+        S += {"random": 4.0, "taylor_green": 1.0, "zero": 0.0, "vortices": 0.0}[p["ic"]] * p["ic_amp"]  # random: peak ~ 4 x rms
+        if p["ic"] == "vortices":  # Gaussian vortex: max swirl speed 0.32 w0 r, x2 for |u| + |v| and neighbours
+            S += sum(0.64 * abs(v[3]) * v[2] for v in p["vortices"])
         if p["A"]:  # laminar amplitude, capped by a multiple of the turbulent scale sqrt(A/k) (heuristic)
             S += min(abs(p["A"]) / (nu * k * k + p["mu"]), 8 * math.sqrt(abs(p["A"]) / k))
         dt_max = p["cfl_max"] * dx / S if S > 0 else 0.1
@@ -173,7 +184,7 @@ class Fluid2D:
         wh = jnp.fft.rfft2(w[0])
         if split:
             wh = self._split(wh, q, g)
-        h, lam = q["dt"], -(q["nu"] * g["k2"] + q["mu"])
+        h, lam = q["dt"], -(q["nu"] * g["k2"] + q["mu"]) + 1j * q["beta"] * g["kx"] * g["inv_k2"]  # -beta v exact
         E1, E2 = jnp.exp(lam * h), jnp.exp(lam * h / 2)
         f = q["A"] * g["f_hat"]
         N = lambda a: self._advection(a, q, g) + f
@@ -191,6 +202,12 @@ class Fluid2D:
         X, Y = np.meshgrid(x, x, indexing="xy")
         if p["ic"] == "zero":
             w = np.zeros((n, n))
+        elif p["ic"] == "vortices":  # sum of w0 exp(-r^2/R^2) on the periodic minimal image, zero-mean
+            w = np.zeros((n, n))
+            for x0, y0, R, w0 in p["vortices"]:
+                ddx, ddy = (X - x0 + L / 2) % L - L / 2, (Y - y0 + L / 2) % L - L / 2
+                w += w0 * np.exp(-(ddx ** 2 + ddy ** 2) / R ** 2)
+            w -= w.mean()
         elif p["ic"] == "taylor_green":  # u = U0 sin(kx) cos(ky), v = -U0 cos(kx) sin(ky)
             k = 2 * np.pi * p["tg_k"] / L
             w = 2 * k * p["ic_amp"] * np.sin(k * X) * np.sin(k * Y)
@@ -304,15 +321,35 @@ class Fluid2D:
         g, q, split = self._setup(p)
         w0, w1 = (jnp.fft.rfft2(jnp.asarray(s, jnp.float32)[0]) * g["dealias"] for s in (prev, nxt))
         wt = self._split(w0, q, g) if split else w0
-        terms = lambda a: (self._advection(a, q, g), -p["nu"] * g["k2"] * a, -p["mu"] * a, p["A"] * g["f_hat"])
+        terms = lambda a: (self._advection(a, q, g), -p["nu"] * g["k2"] * a, -p["mu"] * a, p["A"] * g["f_hat"],
+                           1j * p["beta"] * g["kx"] * g["inv_k2"] * a)
         T = [self._irf(0.5 * (a + b)) for a, b in zip(terms(wt), terms(w1))]
         Dw = self._irf(w1 - w0) / p["dt"]
         P = self._irf(wt - w0) / p["dt"]
-        E = jnp.exp(-(p["nu"] * g["k2"] + p["mu"]) * p["dt"])
+        E = jnp.exp((-(p["nu"] * g["k2"] + p["mu"]) + 1j * p["beta"] * g["kx"] * g["inv_k2"]) * p["dt"])
         N = lambda a: self._advection(a, q, g) + p["A"] * g["f_hat"]
         R = self._irf((w1 - E * wt) / p["dt"] - 0.5 * (E * N(wt) + N(w1)))
         nrm = jnp.linalg.norm
         return float(nrm(R) / (nrm(Dw) + nrm(P) + sum(nrm(t) for t in T) + 1e-30))
+
+
+    def describe(self):
+        info = {"n": (16, 512, "cells", "grid size"), "L": (0, None, "length", "box side"),
+                "nu": (0, None, "L^2/T", "viscosity (or give Re)"), "Re": (0, None, "1", "Reynolds number, see docs"),
+                "mu": (0, None, "1/T", "linear drag"), "A": (None, None, "L/T^2", "Kolmogorov forcing amplitude"),
+                "kf": (1, None, "1", "forcing periods across the box"), "dt": (0, None, "T", "time step (None: from CFL)"),
+                "cfl_max": (0, CFL_STABLE, "1", "CFL safety limit"),
+                "ic": (None, None, "", "random | taylor_green | zero | vortices"), "ic_amp": (0, None, "L/T", "IC rms speed"),
+                "vortices": (None, None, "", "[(x, y, radius, peak w)]"), "beta": (None, None, "1/(L T)", "beta-plane gradient"),
+                "mask": (None, None, "", "(n, n) bool obstacle"), "U_inf": (0, None, "L/T", "free stream along +x"),
+                "eta": (0, None, "T", "penalisation time"), "sponge": (0, 0.5, "1", "sponge width / L")}
+        return {"name": self.name, "fields": list(self.fields),
+                "equations": "dw/dt + (U_inf e_x + u).grad w = nu lap w - mu w + A k_f cos(k_f y) - beta v "
+                             "[+ Brinkman penalisation]; lap psi = -w",
+                "params": {k: {"default": self.DEFAULTS.get(k), "min": a, "max": b, "unit": u, "help": h}
+                           for k, (a, b, u, h) in info.items()},
+                "checks": ["dE/dt = P - 2 nu Z - 2 mu E", "mean vorticity zero", "Taylor-Green / Kolmogorov exact",
+                           "Rossby dispersion sigma = -beta kx / |k|^2"]}
 
 
 def cylinder_mask(n, L, center, radius):

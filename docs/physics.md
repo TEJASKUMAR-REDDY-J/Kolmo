@@ -202,3 +202,132 @@ call of a plain `stepper(params)` also compiles (~1 s); time it separately from 
 * No subgrid model: at high Re the 2/3 truncation is the only small-scale sink besides viscosity, so under-resolved
   runs pile up enstrophy at the cutoff (watch `max_abs_vorticity`). `nu` must be > 0.
 * Square grid only (H = W = n), one scalar field, time-independent forcing.
+
+## Beta-plane and vortices (fluid2d)
+
+`beta` adds `-beta v` to the vorticity equation (Coriolis parameter f = f0 + beta y, +y = north). In Fourier space it
+is the linear term `i beta k_x / |k|^2 w_hat`, folded into the integrating factor, so it is exact and adds no time-step
+limit. A constant f0 (f-plane) has no effect on 2D incompressible flow (its curl is f0 div u = 0), so it is not a
+parameter. `ic = "vortices"` with `vortices = [(x, y, R, w0), ...]` places Gaussian vortices `w0 exp(-r^2/R^2)`
+(periodic minimal image, mean removed).
+
+Measured (tests/test_fluid2d.py):
+* Rossby wave cos(2x + y), beta = 2, t = 5: phase moved -4.00 rad (sigma = -beta k_x / |k|^2, westward); max error
+  1.4e-5 against the exact damped wave.
+* Cyclone R = 0.5, w0 = 5, n = 64, t = 4: the vorticity peak stays put with beta = 0 and moves by (-1.08, +0.79) with
+  beta = 2, i.e. north-west, the beta-drift direction of a northern-hemisphere cyclone.
+* Co-rotating pair R = 0.4, w0 = 5, nu = 1e-3: separation 1.2 merges (peak count 2 -> 1 between t = 15 and 20);
+  separation 2.0 stays two vortices to t = 30. The merger threshold was not scanned finer.
+
+## Spec-driven PDEs (kolmo/systems/pde.py)
+
+`make(spec)` or `make("<library name>")`. A spec gives `fields`, one `rhs` expression per field, `params`, `n`, `L`,
+`dt` and `ic`. It may also give `stabilize` ({field: S}), `energy` (a density in the same grammar, whose box mean is
+reported as `energy`) and `checks`.
+
+Grammar: fields, params, `pi`, numbers, `+ - * / **`, unary minus, and `lap dx dy grad2 exp tanh sin cos`. Expressions
+are parsed by `ast` against a whitelist and never evaluated as Python. Unknown names, functions or syntax raise
+`ValueError` naming them.
+
+* Linear part: the Fourier symbol of d(rhs_i)/d(u_i) at u = 0, obtained with `jax.jvp` on a delta function. The grammar
+  has no x-dependence, so this Jacobian is translation-invariant and diagonal in Fourier space. `stabilize` moves
+  `S lap u` from the explicit to the exact part. Cahn-Hilliard uses S = 1.5, which balances the explicit Jacobian
+  between u = 0 and u = +-1. The remainder N = rhs - L u is explicit, and cross-field linear terms stay explicit.
+* Time stepping: ETDRK4 (Cox & Matthews, J. Comput. Phys. 176, 2002). Its coefficients come from the complex contour
+  mean of Kassam & Trefethen (2005), with 32 points on a unit circle, which avoids cancellation in the phi-functions at
+  small |L dt|. The scheme is fourth order and keeps the ODE's fixed points for any dt. The 2/3 rule dealiases N and
+  the state. This is not alias-free for cubic terms, but it is standard practice.
+* Checks in `validate`, cached per parameter set:
+  * linear growth resolved: `max Re(L) * dt <= 2`;
+  * explicit stiffness: a 30-step power iteration on the Jacobian of N at the seed-0 initial state must give
+    `|J_N| * dt <= 2` (the RK4 bounds are 2.78 on the real axis and 2.83 on the imaginary axis).
+
+  Errors quote the admissible dt. The stiffness estimate holds for the initial state only. For Cahn-Hilliard, the
+  choice of S also covers the later u = +-1 state.
+* `residual`: per Fourier mode, the linear part is exact, and N, taken as linear in time, is integrated exactly against
+  exp(L(dt - s)): `R = (v1 - E v0)/dt - [phi1 N0 + phi2 (N1 - N0)]`. It is normalised by the size of all terms. A plain
+  trapezoid in the integrating-factor variable gave 4.9e-2 for Swift-Hohenberg, because it is inaccurate for slaved
+  high modes (|L dt| >> 1); the phi-form gives 1.5e-6.
+* IC strings, joined by `+`, either one string or {field: string}:
+  * `const:c`;
+  * `noise:A`: white noise in the 2/3 band, std A, seeded by (seed, field);
+  * `bump:A:r`: Gaussian at the centre;
+  * `sin:A:m`: A sin(2 pi m x / L);
+  * `zero`.
+
+Library (defaults in `LIBRARY`):
+
+| name | equation |
+|---|---|
+| `cahn_hilliard` | u_t = lap(u^3 - u) - gamma lap^2 u |
+| `allen_cahn` | u_t = eps2 lap u + u - u^3 |
+| `gray_scott` | two fields, Pearson-type F = 0.04, k = 0.06 |
+| `kuramoto_sivashinsky` | u_t = -lap u - lap^2 u - \|grad u\|^2 / 2 (in 2D the mean drifts down by <\|grad u\|^2>/2) |
+| `swift_hohenberg` | u_t = r u - (1 + lap)^2 u - u^3 |
+| `burgers` | u_t = nu lap u - u (u_x + u_y) |
+
+Measured (tests/test_pde.py, `python -m pytest tests/test_pde.py -q -s`):
+
+| check | result |
+|---|---|
+| Cahn-Hilliard, 1000 steps (t = 30) | max change of mean(u) 2.5e-7 (round-off); free energy 0.3052 -> 0.1957 and never rises; residual 3.4e-6 |
+| KS linear growth, mode k = 0.5, amplitude 1e-4, t = 10 | measured 0.187500 vs k^2 - k^4 = 0.187500 |
+| ETDRK4 order (Allen-Cahn, n = 32, T = 4) | errors 6.0e-2 / 6.35e-3 / 3.73e-4 at dt 0.4 / 0.2 / 0.1; fitted order 3.66 (last pair 4.1) |
+| Gray-Scott positivity, 2000 steps | min(u, v) = 1.1e-13 >= 0 |
+| Allen-Cahn / Swift-Hohenberg / Burgers | energy never rises (largest step change -1e-15 / -1.4e-5 / -5.7e-3); Allen-Cahn stays in [-1, 1]; Burgers mean drift 1.5e-8 |
+| stiffness refusal | Cahn-Hilliard at dt = 0.1 and KS at dt = 10 are rejected with the admissible dt |
+
+KS and Burgers at these sizes cannot be used for an order test: their ETDRK4 error is already at the float32 floor
+(~3e-5) for dt <= 0.2. The library defaults use modest resolution: the Cahn-Hilliard interface spans ~3 cells and
+Gray-Scott fronts ~2 cells at n = 64. Raise n for quantitative work.
+
+### Integrator choice (literature check, Nov 2026)
+
+* ETDRK4 with contour-integral coefficients is still the standard method for stiff semilinear PDEs on periodic domains
+  (Kassam & Trefethen, "Fourth-order time-stepping for stiff PDEs", SIAM J. Sci. Comput. 26, 2005;
+  people.maths.ox.ac.uk/trefethen/fourth-order.pdf).
+* The JAX library Exponax (Koehler et al.; github.com/Ceyron/exponax, fkoehler.site/exponax) is built on Fourier
+  pseudo-spectral ETDRK for the same reason.
+* A 2025 survey of exponential Runge-Kutta methods (arXiv:2507.04024) gives no reason to change.
+* fluid2d and boussinesq keep IF-RK3. Their stiff part is plain diffusion, which IF integrates exactly, and their
+  explicit part is advection, where RK3's imaginary-axis stability matters more than stiff accuracy.
+
+## Boussinesq convection (kolmo/systems/boussinesq.py)
+
+    dw/dt + u . grad w = sqrt(Pr/Ra) lap w + d(theta)/dx
+    dtheta/dt + u . grad theta = lap(theta) / sqrt(Ra Pr),     lap psi = -w
+
+* Units: free-fall units with length H, temperature dT and velocity sqrt(g alpha dT H). Gravity points along -y and
+  buoyancy is +theta e_y, whose curl is d(theta)/dx. The mean temperature drives no mean flow, because the
+  hydrostatic part drops out of the curl.
+* Numerics: as in fluid2d (2/3 rule, IF-RK3 with both diffusions exact). The CFL limit uses a free-fall speed estimate
+  of 2 sqrt(dT L/4).
+* Obstacle: an optional `mask` is penalised to zero velocity and temperature `T_body` (split substep, first order).
+* ICs:
+  * `thermal`: a Gaussian warm blob at (L/2, L/4).
+  * `rayleigh_taylor`: theta = A tanh(sin(2 pi (y + eps cos(2 pi m x/L))/L) L/(2 pi delta)), warm below cold. It is
+    unstable at y = L/2 and stable at y = 0.
+  * `zero`.
+* Diagnostics: energy, enstrophy, buoyancy_flux <v theta>, theta_mean, theta_var = 0.5<theta^2>,
+  thermal_dissipation kappa<|grad theta|^2>, max_abs_vorticity, cfl, centroid_y.
+* Budgets: `dE/dt = <v theta> - 2 nu Z` and `d(0.5<theta^2>)/dt = -kappa <|grad theta|^2>`.
+
+Measured (tests/test_boussinesq.py, Ra = 1e5, Pr = 1, n = 64, L = 2 pi, dt = 0.019):
+
+| check | result |
+|---|---|
+| budgets (central difference, 60 steps) | kinetic 3.8e-5, thermal variance 4.5e-4 (relative); residual 5.3e-5 |
+| rising thermal, t = 4 | centroid height 1.571 -> 1.683 -> 1.999 -> 2.445 -> 2.909 (monotone); x-centroid stays at L/2 to 2.7e-4; mean theta unchanged |
+| Rayleigh-Taylor, eps = 0.05, m = 1 | kinetic energy 7.8e-5 -> 5.9e-2 over t = 3.5; energy growth rate 1.7-1.9 per time unit (exponential phase) |
+| heated disc (T_body = 1), t = 4 | theta 0.116 above the body vs 0.003 below, 0.997 inside; max speed inside 0.038 vs 0.618 outside |
+
+Limitations:
+* Ra = 1e5 at n = 64 is near the resolution limit; raise n for higher Ra.
+* There are no top or bottom walls and the periodic box has no imposed mean gradient, so there is no Rayleigh-Benard
+  Nusselt validation.
+* The RT growth rate is not compared with a theory value (diffuse interface, viscous).
+* The obstacle shares fluid2d's first-order penalisation limits.
+
+### All physics tests
+
+`python -m pytest tests/test_boussinesq.py tests/test_pde.py tests/test_fluid2d.py -q -s` gave `22 passed in 91.93s`.
