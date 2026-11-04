@@ -110,3 +110,19 @@ metrics: `one_step`, `error_at_10`, `steps_to_failure` (median, test split), `su
 `train.fit(ds, cfg, on_progress=None, should_stop=None)` (`train.train` is an alias): progress dicts
 `{"phase", "step", "total", "loss", "val_rollout_error", "eta_s"}` at most 4 per second; `should_stop()` is polled every
 step and ends training after one final validation.
+
+### NCA-hybrid + noise, rollout fine-tune (`benchmarks/nca_ft.json`, run `runs/kolmogorov64_nca_ft-c42bef60`)
+
+Starts from `nca_noise` (noise 0.05 kept), then K=2 (400 steps, lr 3e-4, 1.6 min), then K=4 (400 steps, lr 2e-4,
+2.1 min). Kolmogorov 64x64, same test split (8 trajectories, 200 steps).
+
+| model | relL2@1 | @10 | median ttf | blown-up steps | spec (dex) | E err | ms/step | heldout-nu @10 |
+|---|---|---|---|---|---|---|---|---|
+| NCA + noise | 0.191 | 0.523 | 9 | 283 | 1.27 | +41 | 3.78 | n/a |
+| ft K2 | 0.194 | 0.498 | 11 | 235 | 1.43 | +57 | 4.58 | 0.449 |
+| ft K4 | 0.202 | 0.475 | 12 | 151 | 1.57 | +15 | 4.12 | 0.425 |
+
+Measured: the curriculum lengthens time-to-failure from 9 to 12 steps and halves the blown-up steps (283 -> 151), but
+does not remove them; the spectrum error rises slightly (1.27 -> 1.57 dex). The best NCA (`nca_ft_k4`, registry id
+`kolmogorov64_nca_ft-c42bef60/nca_ft_k4`) stays below the fine-tuned FNO (21 steps, 0 blow-ups), but with 1.7 % of its
+weights and about 3.7x its speed on this CPU.
