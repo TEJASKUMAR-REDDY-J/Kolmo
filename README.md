@@ -89,6 +89,8 @@ The assistant works offline. To use the hosted model, copy `.env.example` to `.e
 rate limit is skipped until it recovers.
 
 Demo-video clips (1080p60, made from the solvers): `python tools/render_clips.py`, written to `video/clips/`.
+3D CFD clip (two vortex rings colliding: spectral 3D Navier-Stokes in JAX at 96³, volume ray-marched):
+`python tools/render_3d.py` (`--check` runs the solver self-check).
 
 ## How it is built
 

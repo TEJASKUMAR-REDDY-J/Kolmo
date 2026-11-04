@@ -270,27 +270,37 @@ def heat_rt(seconds=14):
 
 
 def heat_plume(seconds=14):
+    """Three heated cylinders (held at T = 1) near the floor: buoyant plumes rise, sway and merge."""
     b = make("boussinesq")
-    n = 512
+    n = 384
     y, x = (np.mgrid[0:n, 0:n] + 0.5) / n
-    mask = ((x - 0.5) ** 2 + (y - 0.12) ** 2) <= 0.045 ** 2
-    p = b.validate({"n": n, "Ra": 2e7, "ic": "zero", "mask": mask, "T_body": 1.0})
-    s = b.initial(p, 0).at[1].add(jnp.asarray(0.02 * smooth_noise(n, 1, 20), jnp.float32))
+    bodies = [(0.25, 0.11, 0.032), (0.5, 0.08, 0.04), (0.75, 0.11, 0.032)]
+    mask = np.zeros((n, n), bool)
+    for bx, by, br in bodies:
+        mask |= (x - bx) ** 2 + (y - by) ** 2 <= br ** 2
+    p = b.validate({"n": n, "Ra": 5e6, "ic": "zero", "mask": mask, "T_body": 1.0})
+    s = b.initial(p, 0).at[1].add(jnp.asarray(0.01 * smooth_noise(n, 1, 20), jnp.float32))
     step = b.stepper(p)
-    s = advance(step, int(1.0 / p["dt"]))(s).block_until_ready()
-    k = max(1, round((11.0 / frames(seconds) if not PREVIEW else 0.02) / p["dt"]))
+    s = run_steps(step, s, int(2.0 / p["dt"])).block_until_ready()
+    k = max(1, round((30.0 / frames(seconds) if not PREVIEW else 0.05) / p["dt"]))
     go, out = advance(step, k), Writer("heat_plume")
-    r0 = int(0.06 * n)
-    rows = slice(r0, r0 + int(n * H / W))
+    r0 = int(0.03 * n)
+    rows = (np.arange(int(round(n * H / W))) + r0) % n
+    px = W / n  # screen pixels per cell
     yy, xx = np.mgrid[0:H, 0:W]
-    cx, cy, rad = W * 0.5, H - (0.12 * n - r0) * H / (n * H / W), 0.045 * W
-    body = np.clip((rad - np.hypot(xx - cx, yy - cy)) / 2, 0, 1)[..., None]
-    halo = np.exp(-np.maximum(np.hypot(xx - cx, yy - cy) - rad, 0) / 18)[..., None]
+    body = np.zeros((H, W, 1), np.float32)
+    halo = np.zeros((H, W, 1), np.float32)
+    for bx, by, br in bodies:
+        cx, cy, rad = bx * W, H - (by * n - r0) * px, br * n * px
+        dist = np.hypot(xx - cx, yy - cy)
+        body = np.maximum(body, np.clip((rad - dist) / 2, 0, 1)[..., None])
+        halo = np.maximum(halo, np.exp(-np.maximum(dist - rad, 0) / 22)[..., None])
     for _ in range(frames(seconds)):
         s = go(s)
-        fr = colour(np.asarray(s[1])[rows][::-1], 0, 0.75, INFERNO).astype(np.float32)
-        fr = fr + halo * np.array([255, 150, 60]) * 0.35
-        fr = fr * (1 - body) + body * np.array([255, 236, 200])
+        f = np.where(np.asarray(mask)[rows], 0.0, np.asarray(s[1])[rows])[::-1]
+        fr = colour(f, 0, 0.32, INFERNO).astype(np.float32)
+        fr = fr + halo * np.array([255, 140, 50]) * 0.4
+        fr = fr * (1 - body) + body * np.array([255, 238, 205])
         out(np.clip(fr, 0, 255).astype(np.uint8))
     out.close()
 

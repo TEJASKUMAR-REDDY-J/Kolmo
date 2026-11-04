@@ -48,10 +48,11 @@ Prompt Guard beat at 1:05; technical depth (20 %) → 1:30–2:38; demo (25 %) �
   hiding it."
 
 ### 2:00–2:22 · Range of physics (montage, 3–4 s per clip, cut on the beat)
-- clip: `heat_rt.mp4` → `cyclone.mp4` → `gray_scott.mp4` → `cahn_hilliard.mp4`. End on screen: the **Try a
-  scenario…** menu opening.
-- **VO:** "Heat and buoyancy. Cyclones drifting on a rotating planet. Chemical patterns that copy themselves.
-  Alloys separating. Type an equation and Kolmo builds the solver for it."
+- clip: `rings3d.mp4` (4–5 s: two vortex rings collide in 3D and break apart) → `heat_rt.mp4` → `cyclone.mp4` →
+  `gray_scott.mp4` → `cahn_hilliard.mp4`. End on screen: the **Try a scenario…** menu opening.
+- **VO:** "Full 3D turbulence: two vortex rings colliding. Heat and buoyancy. Cyclones drifting on a rotating
+  planet. Chemical patterns that copy themselves. Alloys separating. Type an equation and Kolmo builds the solver
+  for it."
 
 ### 2:22–2:38 · Engineering depth
 - screen: Simulate running in Zen mode (press Z), with the error-vs-horizon chart and hybrid mode re-anchoring.
